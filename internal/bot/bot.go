@@ -252,11 +252,12 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 		partFileName := fmt.Sprintf("%s_part%d.mp4", strings.TrimSuffix(result.FileName, ".mp4"), partNum)
 
 		video := &tele.Video{
-			File:     tele.FromReader(progressReader),
-			FileName: partFileName,
-			Caption:  caption,
-			Width:    result.Width,
-			Height:   result.Height,
+			File:      tele.FromReader(progressReader),
+			FileName:  partFileName,
+			Caption:   caption,
+			Width:     result.Width,
+			Height:    result.Height,
+			Streaming: true,
 		}
 
 		// Set up send options for threading
@@ -358,11 +359,12 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 
 	// Create video with dimensions for proper display
 	video := &tele.Video{
-		File:     tele.FromReader(progressReader),
-		FileName: result.FileName,
-		Caption:  result.Title,
-		Width:    result.Width,
-		Height:   result.Height,
+		File:      tele.FromReader(progressReader),
+		FileName:  result.FileName,
+		Caption:   result.Title,
+		Width:     result.Width,
+		Height:    result.Height,
+		Streaming: true,
 	}
 
 	// Send the video

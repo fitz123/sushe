@@ -173,3 +173,68 @@ make build
 - yt-dlp (on server)
 - ffmpeg/ffprobe (on server)
 - telegram-bot-api server (on server, for >50MB uploads)
+
+## Operator Access
+
+This section describes restricted access for an AI developer agent working on this bot.
+
+### Server
+
+- **Host**: provided separately (not stored in repo)
+- **User**: `sushe`
+- **SSH alias**: `sushe-bot` (configured in `~/.ssh/config`)
+- **SSH key**: `~/.ssh/sushe-operator`
+
+### Paths
+
+| Path | Description |
+|------|-------------|
+| `/home/sushe/sushe/bin/sushe` | Bot binary |
+| `/tmp/sushe/` | Temp directory for downloads/encoding |
+| `/usr/local/bin/yt-dlp` | yt-dlp binary |
+
+### Systemd Services
+
+| Service | Description |
+|---------|-------------|
+| `sushe.service` | The bot itself |
+| `telegram-bot-api.service` | Local Telegram Bot API server (2GB upload support) |
+
+### Permissions
+
+**Allowed:**
+- `sudo systemctl restart sushe` — restart the bot after deploy
+- `sudo systemctl status sushe` — check bot status
+- `sudo systemctl status telegram-bot-api` — check API server status
+- `sudo sushe-logs` — view bot logs (`journalctl -u sushe`)
+- `sudo sushe-api-logs` — view API server logs (`journalctl -u telegram-bot-api`)
+- `sudo sushe-update-ytdlp` — update yt-dlp to latest version
+
+**Forbidden:**
+- `systemctl restart telegram-bot-api` — do NOT restart the API server
+- Modifying systemd unit files
+- Accessing Telegram secrets (bot token, API ID, API hash)
+- Installing system packages (`apt install`, etc.)
+
+### Setup for Operator
+
+1. **SSH config** — add to `~/.ssh/config`:
+   ```
+   Host sushe-bot
+       HostName <SERVER_IP>
+       User sushe
+       IdentityFile ~/.ssh/sushe-operator
+   ```
+
+2. **`.env` file** — create `.env` in the project root with:
+   ```
+   SERVER="<SERVER_IP>"
+   SSH_HOST="sushe-bot"
+   REMOTE_USER="sushe"
+   ```
+   Note: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` are NOT needed for deploy — they are already on the server.
+
+3. **Workflow:**
+   - `make build` — cross-compile the bot binary
+   - `make update` — build + scp + restart (uses `.env` for SSH)
+   - `make verify` — check service status and recent logs

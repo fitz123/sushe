@@ -204,6 +204,43 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 		}
 
 		logger.Info("Re-encoding complete", "newSize", fileInfo.Size())
+	} else {
+		// Video is already H.264, but apply faststart for better streaming (PiP support)
+		logger.Info("Applying faststart to H.264 video", "codec", codec)
+
+		// Create output file path for faststart version
+		dir := filepath.Dir(filePath)
+		baseName := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+		fastStartPath := filepath.Join(dir, baseName+"_faststart.mp4")
+
+		// Apply faststart using ffmpeg with copy (no re-encoding)
+		args := []string{
+			"-i", filePath,
+			"-c", "copy",
+			"-movflags", "+faststart",
+			"-y", // Overwrite output
+			fastStartPath,
+		}
+
+		cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			logger.Warn("Failed to apply faststart, using original file", "error", err, "output", string(output))
+		} else {
+			// Replace original with faststart version
+			os.Remove(filePath)
+			filePath = fastStartPath
+			fileName = filepath.Base(filePath)
+
+			// Update file info
+			fileInfo, err = os.Stat(filePath)
+			if err != nil {
+				os.RemoveAll(workDir)
+				return nil, fmt.Errorf("failed to stat faststart file: %w", err)
+			}
+
+			logger.Info("Faststart applied successfully", "newSize", fileInfo.Size())
+		}
 	}
 
 	// Get video metadata (duration, dimensions)

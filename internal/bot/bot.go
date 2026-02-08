@@ -257,6 +257,7 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 			Caption:   caption,
 			Width:     result.Width,
 			Height:    result.Height,
+			Duration:  int(result.Duration),
 			Streaming: true,
 		}
 
@@ -364,6 +365,7 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 		Caption:   result.Title,
 		Width:     result.Width,
 		Height:    result.Height,
+		Duration:  int(result.Duration),
 		Streaming: true,
 	}
 

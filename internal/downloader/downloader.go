@@ -38,6 +38,10 @@ const (
 	MaxUploadSize  = 1900 * 1024 * 1024 // 1.9GB - target size for splits
 	DownloadDir    = "/tmp/sushe"
 	DefaultTimeout = 60 * time.Minute // Increased for long videos
+	
+	// Playlist limits
+	MaxPlaylistVideos = 50             // Maximum videos per playlist
+	MaxVideoDuration  = 2 * time.Hour  // Skip videos longer than 2 hours
 )
 
 // MediaInfo contains video metadata from ffprobe
@@ -54,6 +58,22 @@ type PartInfo struct {
 	FilePath string
 	PartNum  int
 	FileSize int64
+}
+
+// PlaylistInfo contains information about a playlist
+type PlaylistInfo struct {
+	ID           string            `json:"id"`
+	Title        string            `json:"title"`
+	PlaylistCount int              `json:"playlist_count"`
+	Entries      []PlaylistEntry   `json:"entries"`
+}
+
+// PlaylistEntry represents a single video in a playlist
+type PlaylistEntry struct {
+	ID       string  `json:"id"`
+	Title    string  `json:"title"`
+	URL      string  `json:"url"`
+	Duration float64 `json:"duration"`
 }
 
 // DownloadResult contains the result of a download operation
@@ -330,6 +350,290 @@ func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback)
 	}
 
 	return cmd.Wait()
+}
+
+// GetPlaylistInfo checks if a URL is a playlist and returns playlist information
+func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*PlaylistInfo, error) {
+	// Use yt-dlp with --flat-playlist --dump-json to check if it's a playlist
+	args := []string{
+		"--flat-playlist",
+		"--dump-json",
+		"--no-warnings",
+		url,
+	}
+
+	logger.Debug("Checking if URL is playlist", "args", args)
+
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get playlist info: %w", err)
+	}
+
+	// Parse the JSON lines output
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("no output from yt-dlp")
+	}
+
+	// Parse each line as a JSON entry
+	var entries []PlaylistEntry
+	var playlistTitle string
+	var playlistID string
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		var entry map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			logger.Warn("Failed to parse playlist entry", "line", line, "error", err)
+			continue
+		}
+
+		// Extract basic info
+		id, _ := entry["id"].(string)
+		title, _ := entry["title"].(string)
+		url, _ := entry["url"].(string)
+		
+		// Handle duration (might be null for unavailable videos)
+		var duration float64
+		if d, ok := entry["duration"]; ok && d != nil {
+			switch v := d.(type) {
+			case float64:
+				duration = v
+			case string:
+				fmt.Sscanf(v, "%f", &duration)
+			}
+		}
+
+		// Get playlist title from first entry (if available)
+		if playlistTitle == "" {
+			if pt, ok := entry["playlist_title"].(string); ok {
+				playlistTitle = pt
+			}
+		}
+		if playlistID == "" {
+			if pid, ok := entry["playlist_id"].(string); ok {
+				playlistID = pid
+			}
+		}
+
+		entries = append(entries, PlaylistEntry{
+			ID:       id,
+			Title:    title,
+			URL:      url,
+			Duration: duration,
+		})
+	}
+
+	// If only one entry, it's likely a single video, not a playlist
+	if len(entries) <= 1 {
+		return nil, fmt.Errorf("not a playlist - single video detected")
+	}
+
+	// Apply playlist limits
+	if len(entries) > MaxPlaylistVideos {
+		logger.Info("Playlist too large, truncating", "total", len(entries), "max", MaxPlaylistVideos)
+		entries = entries[:MaxPlaylistVideos]
+	}
+
+	// Filter out videos that are too long
+	var validEntries []PlaylistEntry
+	for _, entry := range entries {
+		if entry.Duration > 0 && entry.Duration > MaxVideoDuration.Seconds() {
+			logger.Info("Skipping video (too long)", "title", entry.Title, "duration", entry.Duration)
+			continue
+		}
+		validEntries = append(validEntries, entry)
+	}
+
+	if len(validEntries) == 0 {
+		return nil, fmt.Errorf("no valid videos in playlist after filtering")
+	}
+
+	if playlistTitle == "" {
+		playlistTitle = "Unknown Playlist"
+	}
+
+	return &PlaylistInfo{
+		ID:           playlistID,
+		Title:        playlistTitle,
+		PlaylistCount: len(validEntries),
+		Entries:      validEntries,
+	}, nil
+}
+
+// DownloadPlaylistVideo downloads a specific video from a playlist
+func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL string, videoIndex int, progressCb ProgressCallback) (*DownloadResult, error) {
+	// Create unique subdirectory for this download
+	downloadID := fmt.Sprintf("%d", time.Now().UnixNano())
+	workDir := filepath.Join(d.downloadDir, downloadID)
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create work directory: %w", err)
+	}
+
+	// Output template
+	outputTemplate := filepath.Join(workDir, "%(title).100s.%(ext)s")
+
+	// Build yt-dlp command for specific playlist item
+	// Remove --no-playlist and use --playlist-items to download specific video
+	args := []string{
+		fmt.Sprintf("--playlist-items=%d", videoIndex+1), // yt-dlp uses 1-based indexing
+		"-f", "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc][height<=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+		"--merge-output-format", "mp4",
+		"-o", outputTemplate,
+		"--no-warnings",
+		"--progress",
+		"--newline",
+		playlistURL,
+	}
+
+	logger.Debug("Downloading playlist video", "index", videoIndex, "args", args)
+
+	// Create context with timeout
+	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, "yt-dlp", args...)
+	cmd.Dir = workDir
+
+	// If we have a progress callback, stream output; otherwise use simple execution
+	if progressCb != nil {
+		if err := d.runWithProgress(cmd, progressCb); err != nil {
+			logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err)
+			os.RemoveAll(workDir)
+			return nil, fmt.Errorf("download failed: %w", err)
+		}
+	} else {
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err, "output", string(output))
+			os.RemoveAll(workDir)
+			return nil, fmt.Errorf("download failed: %w - %s", err, string(output))
+		}
+	}
+
+	// Find the downloaded file
+	files, err := filepath.Glob(filepath.Join(workDir, "*"))
+	if err != nil || len(files) == 0 {
+		os.RemoveAll(workDir)
+		return nil, fmt.Errorf("no file downloaded")
+	}
+
+	filePath := files[0]
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		os.RemoveAll(workDir)
+		return nil, fmt.Errorf("failed to stat downloaded file: %w", err)
+	}
+
+	fileName := filepath.Base(filePath)
+	title := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+
+	// Check video codec and apply same processing as single video download
+	codec, err := GetVideoCodec(filePath)
+	if err != nil {
+		logger.Warn("Failed to get video codec, assuming needs re-encoding", "error", err)
+		codec = "unknown"
+	}
+
+	logger.Info("Downloaded playlist video codec", "index", videoIndex, "codec", codec, "file", fileName)
+
+	// Re-encode if codec is not H.264 compatible (same logic as single video)
+	if !IsH264Compatible(codec) {
+		logger.Info("Re-encoding playlist video required", "index", videoIndex, "codec", codec, "target", "h264")
+
+		// Notify progress callback about encoding phase
+		if progressCb != nil {
+			progressCb(Progress{
+				Phase:   "encoding",
+				Codec:   codec,
+				Percent: 0,
+			})
+		}
+
+		// Re-encode to H.264
+		newPath, err := d.ReencodeToH264(ctx, filePath, progressCb)
+		if err != nil {
+			os.RemoveAll(workDir)
+			return nil, fmt.Errorf("failed to re-encode to H.264: %w", err)
+		}
+
+		// Remove original, use re-encoded file
+		os.Remove(filePath)
+		filePath = newPath
+		fileName = filepath.Base(filePath)
+
+		// Update file info
+		fileInfo, err = os.Stat(filePath)
+		if err != nil {
+			os.RemoveAll(workDir)
+			return nil, fmt.Errorf("failed to stat re-encoded file: %w", err)
+		}
+
+		logger.Info("Re-encoding complete for playlist video", "index", videoIndex, "newSize", fileInfo.Size())
+	} else {
+		// Apply faststart for better streaming
+		logger.Info("Applying faststart to playlist video", "index", videoIndex, "codec", codec)
+
+		dir := filepath.Dir(filePath)
+		baseName := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+		fastStartPath := filepath.Join(dir, baseName+"_faststart.mp4")
+
+		// Apply faststart using ffmpeg with copy
+		args := []string{
+			"-i", filePath,
+			"-c", "copy",
+			"-movflags", "+faststart",
+			"-y",
+			fastStartPath,
+		}
+
+		cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			logger.Warn("Failed to apply faststart to playlist video, using original", "index", videoIndex, "error", err, "output", string(output))
+		} else {
+			// Replace original with faststart version
+			os.Remove(filePath)
+			filePath = fastStartPath
+			fileName = filepath.Base(filePath)
+
+			// Update file info
+			fileInfo, err = os.Stat(filePath)
+			if err != nil {
+				os.RemoveAll(workDir)
+				return nil, fmt.Errorf("failed to stat faststart file: %w", err)
+			}
+
+			logger.Info("Faststart applied to playlist video", "index", videoIndex, "newSize", fileInfo.Size())
+		}
+	}
+
+	// Get video metadata (duration, dimensions)
+	mediaInfo, _ := GetMediaInfo(filePath)
+	var duration float64
+	var width, height int
+	if mediaInfo != nil {
+		duration = mediaInfo.Duration
+		width = mediaInfo.Width
+		height = mediaInfo.Height
+	}
+
+	return &DownloadResult{
+		FilePath:    filePath,
+		FileName:    fileName,
+		Title:       title,
+		Duration:    duration,
+		FileSize:    fileInfo.Size(),
+		Width:       width,
+		Height:      height,
+		ContentType: getContentType(filePath),
+		IsSplit:     false,
+		Parts:       nil,
+	}, nil
 }
 
 // Cleanup removes the downloaded file and its directory

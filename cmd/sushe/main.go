@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -29,10 +30,12 @@ func main() {
 	}
 
 	// Initialize the bot with local API server
+	// Custom HTTP client with long timeout for large file uploads (up to 2GB via local Bot API)
 	botPref := tele.Settings{
 		Token:  token,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
 		URL:    apiURL,
+		Client: &http.Client{Timeout: 60 * time.Minute},
 	}
 
 	botInstance, err := tele.NewBot(botPref)

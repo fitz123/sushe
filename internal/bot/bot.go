@@ -32,14 +32,16 @@ func (pr *ProgressReader) Read(p []byte) (int, error) {
 }
 
 type BotService struct {
-	bot        *tele.Bot
-	downloader *downloader.Downloader
+	bot          *tele.Bot
+	downloader   *downloader.Downloader
+	allowedUsers AllowedUsers
 }
 
-func NewBotService(bot *tele.Bot) *BotService {
+func NewBotService(bot *tele.Bot, allowedUsers AllowedUsers) *BotService {
 	bs := &BotService{
-		bot:        bot,
-		downloader: downloader.New(),
+		bot:          bot,
+		downloader:   downloader.New(),
+		allowedUsers: allowedUsers,
 	}
 	bs.registerHandlers()
 	return bs
@@ -54,6 +56,9 @@ func (bs *BotService) Stop() {
 }
 
 func (bs *BotService) registerHandlers() {
+	// Apply auth middleware to restrict access to whitelisted users
+	bs.bot.Use(AuthMiddleware(bs.allowedUsers))
+
 	bs.bot.Handle("/start", bs.handleStart)
 	bs.bot.Handle("/help", bs.handleHelp)
 

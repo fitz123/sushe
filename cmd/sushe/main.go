@@ -44,8 +44,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Load allowed users whitelist from env
+	allowedUsers := bot.LoadAllowedUsers()
+
 	// Initialize bot service
-	botService := bot.NewBotService(botInstance)
+	botService := bot.NewBotService(botInstance, allowedUsers)
 
 	// Start the bot
 	go botService.Start()

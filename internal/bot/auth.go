@@ -10,7 +10,7 @@ import (
 )
 
 // AllowedUsers holds the set of authorized Telegram user IDs.
-// If empty, all users are allowed (backwards compatible).
+// If empty or nil, NO users are allowed (fail-closed).
 type AllowedUsers map[int64]struct{}
 
 // LoadAllowedUsers parses the SUSHE_ALLOWED_USERS env variable.
@@ -18,7 +18,8 @@ type AllowedUsers map[int64]struct{}
 func LoadAllowedUsers() AllowedUsers {
 	raw := os.Getenv("SUSHE_ALLOWED_USERS")
 	if raw == "" {
-		return nil
+		logger.Warn("SUSHE_ALLOWED_USERS not set — all access denied (fail-closed)")
+		return make(AllowedUsers) // empty non-nil map = deny all
 	}
 
 	allowed := make(AllowedUsers)
@@ -36,7 +37,8 @@ func LoadAllowedUsers() AllowedUsers {
 	}
 
 	if len(allowed) == 0 {
-		return nil
+		logger.Warn("SUSHE_ALLOWED_USERS contains no valid IDs — all access denied (fail-closed)")
+		return allowed // empty non-nil map = deny all
 	}
 
 	logger.Info("Loaded allowed users whitelist", "count", len(allowed))
@@ -44,13 +46,10 @@ func LoadAllowedUsers() AllowedUsers {
 }
 
 // AuthMiddleware returns a telebot middleware that restricts access to whitelisted users.
-// If allowedUsers is nil or empty, all users are permitted.
+// If allowedUsers is nil or empty, NO users are permitted (fail-closed).
 func AuthMiddleware(allowedUsers AllowedUsers) tele.MiddlewareFunc {
 	return func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
-			if len(allowedUsers) == 0 {
-				return next(c)
-			}
 
 			sender := c.Sender()
 			if sender == nil {

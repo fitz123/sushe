@@ -100,37 +100,13 @@ func (bs *BotService) handleHelp(c tele.Context) error {
 	)
 }
 
-// threadOpts returns SendOptions with ThreadID preserved for forum topic support.
-// If the incoming message is in a forum topic, replies will go to the same topic.
-func threadOpts(c tele.Context, extra ...*tele.SendOptions) *tele.SendOptions {
-	var opts *tele.SendOptions
-	if len(extra) > 0 && extra[0] != nil {
-		opts = extra[0]
-	} else {
-		opts = &tele.SendOptions{}
-	}
-	if msg := c.Message(); msg != nil && msg.ThreadID != 0 {
-		opts.ThreadID = msg.ThreadID
-	}
-	return opts
-}
-
-// sendInThread sends a message preserving forum topic context.
-func (bs *BotService) sendInThread(c tele.Context, what interface{}, opts ...*tele.SendOptions) (*tele.Message, error) {
-	return bs.bot.Send(c.Chat(), what, threadOpts(c, opts...))
-}
-
 func (bs *BotService) handleText(c tele.Context) error {
 	text := c.Text()
 
 	// Extract URLs from the message
 	urls := downloader.ExtractURLs(text)
 	if len(urls) == 0 {
-		// In group/supergroup chats, silently ignore non-URL messages
-		if c.Chat().Type != tele.ChatPrivate {
-			return nil
-		}
-		// In private chats, send help hint
+		// No URLs found, ignore the message or send help
 		if !strings.HasPrefix(text, "/") {
 			return c.Send("No video URL detected. Send me a link to download a video!")
 		}
@@ -159,7 +135,7 @@ func (bs *BotService) processURL(c tele.Context, url string) error {
 
 	// Not a playlist or failed to get playlist info, process as single video
 	// Send initial status (no URL to avoid link preview)
-	statusMsg, err := bs.sendInThread(c, "Starting download...")
+	statusMsg, err := bs.bot.Send(c.Chat(), "Starting download...")
 	if err != nil {
 		return err
 	}
@@ -238,7 +214,7 @@ func (bs *BotService) processURL(c tele.Context, url string) error {
 func (bs *BotService) processPlaylist(c tele.Context, playlistURL string, playlistInfo *downloader.PlaylistInfo) error {
 	// Send playlist information message
 	playlistMsg := fmt.Sprintf("Playlist: %s — %d videos", playlistInfo.Title, playlistInfo.PlaylistCount)
-	statusMsg, err := bs.sendInThread(c, playlistMsg)
+	statusMsg, err := bs.bot.Send(c.Chat(), playlistMsg)
 	if err != nil {
 		return err
 	}
@@ -423,8 +399,8 @@ func (bs *BotService) uploadPlaylistSingleVideo(c tele.Context, statusMsg *tele.
 		Streaming: true,
 	}
 
-	// Set up send options for threading (includes forum topic support)
-	opts := threadOpts(c)
+	// Set up send options for threading
+	opts := &tele.SendOptions{}
 	if replyTo != nil {
 		opts.ReplyTo = replyTo
 	}
@@ -533,8 +509,8 @@ func (bs *BotService) handlePlaylistLargeVideo(c tele.Context, statusMsg *tele.M
 			Streaming: true,
 		}
 
-		// Set up send options for threading (includes forum topic support)
-		opts := threadOpts(c)
+		// Set up send options for threading
+		opts := &tele.SendOptions{}
 		if partNum == 1 {
 			// First part replies to previous video (if any)
 			if replyTo != nil {
@@ -662,8 +638,8 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 			Streaming: true,
 		}
 
-		// Set up send options for threading (includes forum topic support)
-		opts := threadOpts(c)
+		// Set up send options for threading
+		opts := &tele.SendOptions{}
 		if prevMsg != nil {
 			opts.ReplyTo = prevMsg
 		}
@@ -770,9 +746,8 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 		Streaming: true,
 	}
 
-	// Send the video (preserve forum topic)
-	opts := threadOpts(c)
-	_, err = bs.bot.Send(c.Chat(), video, opts)
+	// Send the video
+	_, err = bs.bot.Send(c.Chat(), video)
 	if err != nil {
 		// If video fails, try sending as document
 		logger.Warn("Failed to send as video, trying as document", "error", err)
@@ -791,7 +766,7 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 			Caption:  result.Title,
 		}
 
-		_, err = bs.bot.Send(c.Chat(), doc, opts)
+		_, err = bs.bot.Send(c.Chat(), doc)
 		if err != nil {
 			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to upload: %v", err))
 			return err

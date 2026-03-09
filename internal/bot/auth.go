@@ -14,21 +14,11 @@ import (
 type AllowedUsers map[int64]struct{}
 
 // LoadAllowedUsers parses the SUSHE_ALLOWED_USERS env variable.
-// Falls back to reading allowed_users.txt from the working directory.
 // Expected format: comma-separated user IDs, e.g. "306600687,1352262047"
 func LoadAllowedUsers() AllowedUsers {
 	raw := os.Getenv("SUSHE_ALLOWED_USERS")
-
-	// Fallback: read from allowed_users.txt if env var is not set
 	if raw == "" {
-		if data, err := os.ReadFile("allowed_users.txt"); err == nil {
-			raw = strings.TrimSpace(string(data))
-			logger.Info("Loaded allowed users from allowed_users.txt")
-		}
-	}
-
-	if raw == "" {
-		logger.Warn("SUSHE_ALLOWED_USERS not set and allowed_users.txt not found — all access denied (fail-closed)")
+		logger.Warn("SUSHE_ALLOWED_USERS not set — all access denied (fail-closed)")
 		return make(AllowedUsers) // empty non-nil map = deny all
 	}
 
@@ -40,14 +30,14 @@ func LoadAllowedUsers() AllowedUsers {
 		}
 		id, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
-			logger.Warn("Invalid user ID in allowed users, skipping", "value", s, "error", err)
+			logger.Warn("Invalid user ID in SUSHE_ALLOWED_USERS, skipping", "value", s, "error", err)
 			continue
 		}
 		allowed[id] = struct{}{}
 	}
 
 	if len(allowed) == 0 {
-		logger.Warn("Allowed users list contains no valid IDs — all access denied (fail-closed)")
+		logger.Warn("SUSHE_ALLOWED_USERS contains no valid IDs — all access denied (fail-closed)")
 		return allowed // empty non-nil map = deny all
 	}
 

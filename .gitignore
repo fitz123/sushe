@@ -34,3 +34,5 @@ tmp/
 # Downloaded files
 /tmp/sushe/
 sushe
+.ralphex/progress/
+.ralphex/worktrees/

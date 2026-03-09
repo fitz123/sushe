@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/fitz123/sushe/internal/downloader"
+	"github.com/fitz123/sushe/internal/engine"
 	"github.com/fitz123/sushe/internal/logger"
+	"github.com/fitz123/sushe/internal/upload"
 	tele "gopkg.in/telebot.v3"
 )
 
@@ -33,14 +35,14 @@ func (pr *ProgressReader) Read(p []byte) (int, error) {
 
 type BotService struct {
 	bot          *tele.Bot
-	downloader   *downloader.Downloader
+	engine       *engine.Engine
 	allowedUsers AllowedUsers
 }
 
-func NewBotService(bot *tele.Bot, allowedUsers AllowedUsers) *BotService {
+func NewBotService(bot *tele.Bot, eng *engine.Engine, allowedUsers AllowedUsers) *BotService {
 	bs := &BotService{
 		bot:          bot,
-		downloader:   downloader.New(),
+		engine:       eng,
 		allowedUsers: allowedUsers,
 	}
 	bs.registerHandlers()
@@ -61,6 +63,7 @@ func (bs *BotService) registerHandlers() {
 
 	bs.bot.Handle("/start", bs.handleStart)
 	bs.bot.Handle("/help", bs.handleHelp)
+	bs.bot.Handle("/dl", bs.handleDL)
 
 	// Handle all text messages to auto-detect URLs
 	bs.bot.Handle(tele.OnText, bs.handleText)
@@ -100,6 +103,35 @@ func (bs *BotService) handleHelp(c tele.Context) error {
 	)
 }
 
+// handleDL handles the /dl command with GENERAL topic guard
+func (bs *BotService) handleDL(c tele.Context) error {
+	// GENERAL topic guard (Bot API bug #447)
+	if c.Message() != nil && c.Chat() != nil && c.Chat().Type != tele.ChatPrivate {
+		threadID := c.Message().ThreadID
+		if threadID == 0 || threadID == 1 {
+			return c.Send("⚠️ Please use /dl in a named topic (not General)")
+		}
+	}
+
+	text := c.Message().Payload
+	if text == "" {
+		return c.Send("Usage: /dl <video URL>")
+	}
+
+	urls := downloader.ExtractURLs(text)
+	if len(urls) == 0 {
+		return c.Send("No video URL detected. Send a valid link after /dl")
+	}
+
+	for _, url := range urls {
+		if err := bs.processURL(c, url); err != nil {
+			logger.Error("Failed to process URL", "url", url, "error", err)
+		}
+	}
+
+	return nil
+}
+
 func (bs *BotService) handleText(c tele.Context) error {
 	text := c.Text()
 
@@ -125,62 +157,59 @@ func (bs *BotService) handleText(c tele.Context) error {
 }
 
 func (bs *BotService) processURL(c tele.Context, url string) error {
-	// First check if this is a playlist
 	ctx := context.Background()
-	playlistInfo, err := bs.downloader.GetPlaylistInfo(ctx, url)
-	if err == nil && playlistInfo != nil {
-		// It's a playlist, process it differently
+
+	// First check if this is a playlist
+	isPlaylist, playlistInfo, _ := bs.engine.IsPlaylist(ctx, url)
+	if isPlaylist && playlistInfo != nil {
 		return bs.processPlaylist(c, url, playlistInfo)
 	}
 
-	// Not a playlist or failed to get playlist info, process as single video
-	// Send initial status (no URL to avoid link preview)
+	// Not a playlist, process as single video
 	statusMsg, err := bs.bot.Send(c.Chat(), "Starting download...")
 	if err != nil {
 		return err
 	}
 
-	// Track last update time to avoid Telegram rate limits
+	// Progress callback for download — updates Telegram status message
 	var lastUpdate time.Time
 	var lastPercent float64
 	var mu sync.Mutex
 	const minUpdateInterval = 2 * time.Second
 
-	// Progress callback for download (no URLs to avoid link previews)
-	progressCb := func(p downloader.Progress) {
+	progressCb := func(phase string, percent float64, detail string) {
 		mu.Lock()
 		defer mu.Unlock()
 
-		// Rate limit updates to avoid Telegram API limits
 		now := time.Now()
-		if now.Sub(lastUpdate) < minUpdateInterval && p.Percent < 100 {
-			// Skip if we updated recently, unless it's 100%
-			// Also skip if percent hasn't changed much
-			if p.Percent-lastPercent < 5 {
+		if now.Sub(lastUpdate) < minUpdateInterval && percent < 100 {
+			if percent-lastPercent < 5 {
 				return
 			}
 		}
 
 		var statusText string
-		switch p.Phase {
+		switch phase {
 		case "downloading":
-			if p.Speed != "" && p.ETA != "" {
-				statusText = fmt.Sprintf("Downloading: %.0f%%\nSize: %s | Speed: %s | ETA: %s",
-					p.Percent, p.Total, p.Speed, p.ETA)
+			if detail != "" {
+				statusText = fmt.Sprintf("Downloading: %.0f%% | %s", percent, detail)
 			} else {
-				statusText = fmt.Sprintf("Downloading: %.0f%%", p.Percent)
+				statusText = fmt.Sprintf("Downloading: %.0f%%", percent)
 			}
 		case "merging":
 			statusText = "Merging video and audio..."
 		case "encoding":
-			if p.Codec != "" && p.Percent == 0 {
-				statusText = fmt.Sprintf("Downloaded %s format, converting to H.264...", strings.ToUpper(p.Codec))
+			if detail != "" && percent == 0 {
+				statusText = fmt.Sprintf("Downloaded %s format, converting to H.264...", strings.ToUpper(detail))
 			} else {
-				statusText = fmt.Sprintf("Converting to H.264: %.0f%%", p.Percent)
+				statusText = fmt.Sprintf("Converting to H.264: %.0f%%", percent)
 			}
 		case "splitting":
-			statusText = fmt.Sprintf("Splitting video: Part %d/%d (%.0f%%)",
-				p.PartNum, p.TotalParts, p.Percent)
+			if detail != "" {
+				statusText = fmt.Sprintf("Splitting video: %s (%.0f%%)", detail, percent)
+			} else {
+				statusText = fmt.Sprintf("Splitting video: %.0f%%", percent)
+			}
 		default:
 			statusText = "Processing..."
 		}
@@ -189,181 +218,115 @@ func (bs *BotService) processURL(c tele.Context, url string) error {
 			logger.Debug("Failed to update status message", "error", err)
 		} else {
 			lastUpdate = now
-			lastPercent = p.Percent
+			lastPercent = percent
 		}
 	}
 
-	// Download the video with progress
-	result, err := bs.downloader.DownloadWithProgress(ctx, url, progressCb)
+	// Download and process via engine
+	result, err := bs.engine.Process(ctx, url, progressCb)
 	if err != nil {
 		bs.bot.Edit(statusMsg, fmt.Sprintf("Download failed: %v", err))
 		return err
 	}
-	defer bs.downloader.Cleanup(result)
+	defer bs.engine.Cleanup(result)
 
-	// Check if we need to split the video
-	if downloader.NeedsSplit(result.FileSize) {
-		return bs.handleLargeVideo(c, statusMsg, result, url, progressCb)
+	// Upload
+	if result.IsSplit {
+		return bs.uploadSplitVideo(c, statusMsg, result, nil)
 	}
-
-	// Single file upload
 	return bs.uploadSingleVideo(c, statusMsg, result)
 }
 
 // processPlaylist handles downloading and uploading playlist videos
 func (bs *BotService) processPlaylist(c tele.Context, playlistURL string, playlistInfo *downloader.PlaylistInfo) error {
-	// Send playlist information message
 	playlistMsg := fmt.Sprintf("Playlist: %s — %d videos", playlistInfo.Title, playlistInfo.PlaylistCount)
 	statusMsg, err := bs.bot.Send(c.Chat(), playlistMsg)
 	if err != nil {
 		return err
 	}
 
-	var lastReplyMsg *tele.Message // For threading videos as replies
+	// Progress callback for playlist downloads
+	progressCb := func(videoNum, totalVideos int, phase string, percent float64) {
+		var statusText string
+		switch phase {
+		case "downloading":
+			statusText = fmt.Sprintf("Video %d/%d: Downloading %.0f%%", videoNum, totalVideos, percent)
+		case "encoding":
+			statusText = fmt.Sprintf("Video %d/%d: Converting to H.264: %.0f%%", videoNum, totalVideos, percent)
+		case "splitting":
+			statusText = fmt.Sprintf("Video %d/%d: Splitting: %.0f%%", videoNum, totalVideos, percent)
+		default:
+			statusText = fmt.Sprintf("Video %d/%d: Processing...", videoNum, totalVideos)
+		}
+		bs.bot.Edit(statusMsg, statusText)
+	}
 
-	// Process each video in the playlist sequentially
-	for i, entry := range playlistInfo.Entries {
+	ctx := context.Background()
+	results, err := bs.engine.ProcessPlaylist(ctx, playlistURL, progressCb)
+	if err != nil {
+		bs.bot.Edit(statusMsg, fmt.Sprintf("Playlist download failed: %v", err))
+		return err
+	}
+
+	var lastReplyMsg *tele.Message
+
+	for i, result := range results {
 		videoNum := i + 1
-		
-		// Update status message
-		statusText := fmt.Sprintf("Video %d/%d: Starting download...\n%s", 
-			videoNum, playlistInfo.PlaylistCount, entry.Title)
-		if _, err := bs.bot.Edit(statusMsg, statusText); err != nil {
-			logger.Debug("Failed to update playlist status", "error", err)
-		}
 
-		// Progress callback for this specific video
-		var lastUpdate time.Time
-		var lastPercent float64
-		var mu sync.Mutex
+		// Update status for upload phase
+		bs.bot.Edit(statusMsg, fmt.Sprintf("Video %d/%d: Uploading...\n%s | %s",
+			videoNum, len(results), result.Title, formatSize(result.FileSize)))
 
-		progressCb := func(p downloader.Progress) {
-			mu.Lock()
-			defer mu.Unlock()
-
-			// Rate limit updates
-			now := time.Now()
-			if now.Sub(lastUpdate) < 2*time.Second && p.Percent < 100 {
-				if p.Percent-lastPercent < 5 {
-					return
-				}
-			}
-
-			var statusText string
-			switch p.Phase {
-			case "downloading":
-				if p.Speed != "" && p.ETA != "" {
-					statusText = fmt.Sprintf("Video %d/%d: Downloading %.0f%%\n%s\nSpeed: %s | ETA: %s",
-						videoNum, playlistInfo.PlaylistCount, p.Percent, entry.Title, p.Speed, p.ETA)
-				} else {
-					statusText = fmt.Sprintf("Video %d/%d: Downloading %.0f%%\n%s",
-						videoNum, playlistInfo.PlaylistCount, p.Percent, entry.Title)
-				}
-			case "merging":
-				statusText = fmt.Sprintf("Video %d/%d: Merging video and audio...\n%s",
-					videoNum, playlistInfo.PlaylistCount, entry.Title)
-			case "encoding":
-				if p.Codec != "" && p.Percent == 0 {
-					statusText = fmt.Sprintf("Video %d/%d: Converting %s to H.264...\n%s",
-						videoNum, playlistInfo.PlaylistCount, strings.ToUpper(p.Codec), entry.Title)
-				} else {
-					statusText = fmt.Sprintf("Video %d/%d: Converting to H.264: %.0f%%\n%s",
-						videoNum, playlistInfo.PlaylistCount, p.Percent, entry.Title)
-				}
-			case "splitting":
-				statusText = fmt.Sprintf("Video %d/%d: Splitting: Part %d/%d (%.0f%%)\n%s",
-					videoNum, playlistInfo.PlaylistCount, p.PartNum, p.TotalParts, p.Percent, entry.Title)
-			default:
-				statusText = fmt.Sprintf("Video %d/%d: Processing...\n%s",
-					videoNum, playlistInfo.PlaylistCount, entry.Title)
-			}
-
-			if _, err := bs.bot.Edit(statusMsg, statusText); err == nil {
-				lastUpdate = now
-				lastPercent = p.Percent
-			}
-		}
-
-		// Download the specific video from the playlist
-		ctx := context.Background()
-		result, err := bs.downloader.DownloadPlaylistVideo(ctx, playlistURL, i, progressCb)
-		if err != nil {
-			// Log error but continue with next video
-			logger.Error("Failed to download playlist video", "index", i, "title", entry.Title, "error", err)
-			
-			errorText := fmt.Sprintf("Video %d/%d: Download failed - %v\n%s", 
-				videoNum, playlistInfo.PlaylistCount, err, entry.Title)
-			if _, err := bs.bot.Edit(statusMsg, errorText); err != nil {
-				logger.Debug("Failed to update error status", "error", err)
-			}
-			
-			time.Sleep(2 * time.Second) // Brief pause before continuing
-			continue
-		}
-
-		// Check if video needs splitting
 		var uploadedMsg *tele.Message
-		if downloader.NeedsSplit(result.FileSize) {
-			// Handle large video splitting and upload
-			uploadedMsg, err = bs.handlePlaylistLargeVideo(c, statusMsg, result, videoNum, playlistInfo.PlaylistCount, lastReplyMsg)
+		var uploadErr error
+
+		if result.IsSplit {
+			uploadedMsg, uploadErr = bs.uploadPlaylistSplitVideo(c, statusMsg, result, videoNum, len(results), lastReplyMsg)
 		} else {
-			// Upload single video
-			uploadedMsg, err = bs.uploadPlaylistSingleVideo(c, statusMsg, result, videoNum, playlistInfo.PlaylistCount, lastReplyMsg)
+			uploadedMsg, uploadErr = bs.uploadPlaylistSingleVideo(c, statusMsg, result, videoNum, len(results), lastReplyMsg)
 		}
 
-		// Clean up the downloaded video
-		bs.downloader.Cleanup(result)
+		bs.engine.Cleanup(result)
 
-		if err != nil {
-			// Log error but continue with next video
-			logger.Error("Failed to upload playlist video", "index", i, "title", entry.Title, "error", err)
-			
-			errorText := fmt.Sprintf("Video %d/%d: Upload failed - %v\n%s", 
-				videoNum, playlistInfo.PlaylistCount, err, entry.Title)
-			if _, err := bs.bot.Edit(statusMsg, errorText); err != nil {
-				logger.Debug("Failed to update upload error status", "error", err)
-			}
-			
-			time.Sleep(2 * time.Second) // Brief pause before continuing
+		if uploadErr != nil {
+			logger.Error("Failed to upload playlist video", "index", i, "title", result.Title, "error", uploadErr)
+			bs.bot.Edit(statusMsg, fmt.Sprintf("Video %d/%d: Upload failed - %v\n%s",
+				videoNum, len(results), uploadErr, result.Title))
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		// Use the last uploaded message as the reply target for the next video (threading)
 		lastReplyMsg = uploadedMsg
 
-		logger.Info("Successfully processed playlist video", 
-			"index", i+1, 
-			"title", result.Title, 
+		logger.Info("Successfully processed playlist video",
+			"index", i+1,
+			"title", result.Title,
 			"size", result.FileSize,
 			"user", c.Sender().Username)
 	}
 
-	// Delete the status message after all videos are processed
 	bs.bot.Delete(statusMsg)
 
-	logger.Info("Successfully processed playlist", 
-		"title", playlistInfo.Title, 
+	logger.Info("Successfully processed playlist",
+		"title", playlistInfo.Title,
 		"videos", playlistInfo.PlaylistCount,
 		"user", c.Sender().Username)
 
 	return nil
 }
 
-// uploadPlaylistSingleVideo uploads a single video from a playlist
-func (bs *BotService) uploadPlaylistSingleVideo(c tele.Context, statusMsg *tele.Message, result *downloader.DownloadResult, videoNum, totalVideos int, replyTo *tele.Message) (*tele.Message, error) {
-	// Update status for upload phase
-	statusText := fmt.Sprintf("Video %d/%d: Uploading 0%%\n%s | %s",
-		videoNum, totalVideos, result.Title, formatSize(result.FileSize))
-	bs.bot.Edit(statusMsg, statusText)
+// uploadSingleVideo uploads a non-split video result
+func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message, result *engine.ProcessResult) error {
+	bs.bot.Edit(statusMsg, fmt.Sprintf("Uploading: 0%%\n%s | %s",
+		result.Title, formatSize(result.FileSize)))
 
-	// Open the file
 	file, err := os.Open(result.FilePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open downloaded file: %w", err)
+		bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to open downloaded file: %v", err))
+		return err
 	}
 	defer file.Close()
 
-	// Create progress reader for upload tracking
 	var lastUploadUpdate time.Time
 	var lastUploadPercent float64
 	progressReader := &ProgressReader{
@@ -372,14 +335,11 @@ func (bs *BotService) uploadPlaylistSingleVideo(c tele.Context, statusMsg *tele.
 		onProgress: func(read, total int64) {
 			now := time.Now()
 			percent := float64(read) / float64(total) * 100
-
-			// Rate limit updates
 			if now.Sub(lastUploadUpdate) < 2*time.Second && percent-lastUploadPercent < 10 {
 				return
 			}
-
-			statusText := fmt.Sprintf("Video %d/%d: Uploading %.0f%%\n%s | %s/%s",
-				videoNum, totalVideos, percent, result.Title, formatSize(read), formatSize(total))
+			statusText := fmt.Sprintf("Uploading: %.0f%%\n%s | %s/%s",
+				percent, result.Title, formatSize(read), formatSize(total))
 			if _, err := bs.bot.Edit(statusMsg, statusText); err == nil {
 				lastUploadUpdate = now
 				lastUploadPercent = percent
@@ -387,210 +347,58 @@ func (bs *BotService) uploadPlaylistSingleVideo(c tele.Context, statusMsg *tele.
 		},
 	}
 
-	// Create video with caption including playlist position
-	caption := fmt.Sprintf("%s\n\nVideo %d/%d", result.Title, videoNum, totalVideos)
 	video := &tele.Video{
 		File:      tele.FromReader(progressReader),
 		FileName:  result.FileName,
-		Caption:   caption,
+		Caption:   result.Title,
 		Width:     result.Width,
 		Height:    result.Height,
 		Duration:  int(result.Duration),
 		Streaming: true,
 	}
 
-	// Set up send options for threading
-	opts := &tele.SendOptions{}
-	if replyTo != nil {
-		opts.ReplyTo = replyTo
-	}
-
-	// Send the video
-	sentMsg, err := bs.bot.Send(c.Chat(), video, opts)
+	_, err = upload.SendWithRetry(bs.bot, c.Chat(), video)
 	if err != nil {
-		// If video fails, try sending as document
-		logger.Warn("Failed to send playlist video as video, trying as document", "video", videoNum, "error", err)
+		logger.Warn("Failed to send as video, trying as document", "error", err)
 
-		// Re-open file (reader was consumed)
 		file2, err2 := os.Open(result.FilePath)
 		if err2 != nil {
-			return nil, fmt.Errorf("failed to send video: %w", err)
+			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to send video: %v", err))
+			return err
 		}
 		defer file2.Close()
 
 		doc := &tele.Document{
 			File:     tele.FromReader(file2),
 			FileName: result.FileName,
-			Caption:  caption,
+			Caption:  result.Title,
 		}
 
-		sentMsg, err = bs.bot.Send(c.Chat(), doc, opts)
+		_, err = upload.SendWithRetry(bs.bot, c.Chat(), doc)
 		if err != nil {
-			return nil, fmt.Errorf("failed to upload: %w", err)
+			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to upload: %v", err))
+			return err
 		}
 	}
 
-	return sentMsg, nil
+	bs.bot.Delete(statusMsg)
+
+	logger.Info("Successfully processed video",
+		"title", result.Title,
+		"size", result.FileSize,
+		"user", c.Sender().Username,
+	)
+
+	return nil
 }
 
-// handlePlaylistLargeVideo handles splitting and uploading large videos from playlists
-func (bs *BotService) handlePlaylistLargeVideo(c tele.Context, statusMsg *tele.Message, result *downloader.DownloadResult, videoNum, totalVideos int, replyTo *tele.Message) (*tele.Message, error) {
-	numParts := downloader.CalculateNumParts(result.FileSize)
-	statusText := fmt.Sprintf("Video %d/%d: %s - splitting into %d parts...\n%s",
-		videoNum, totalVideos, formatSize(result.FileSize), numParts, result.Title)
-	bs.bot.Edit(statusMsg, statusText)
+// uploadSplitVideo uploads a split video (multiple parts) with threading
+func (bs *BotService) uploadSplitVideo(c tele.Context, statusMsg *tele.Message, result *engine.ProcessResult, replyTo *tele.Message) error {
+	totalParts := len(result.Parts)
+	var prevMsg *tele.Message = replyTo
 
-	// Split progress callback
-	progressCb := func(p downloader.Progress) {
-		if p.Phase == "splitting" {
-			statusText := fmt.Sprintf("Video %d/%d: Splitting: Part %d/%d (%.0f%%)\n%s",
-				videoNum, totalVideos, p.PartNum, p.TotalParts, p.Percent, result.Title)
-			bs.bot.Edit(statusMsg, statusText)
-		}
-	}
-
-	// Split the video
-	ctx := context.Background()
-	parts, err := bs.downloader.SplitVideo(ctx, result.FilePath, progressCb)
-	if err != nil {
-		return nil, fmt.Errorf("failed to split video: %w", err)
-	}
-
-	totalParts := len(parts)
-	var lastPartMsg *tele.Message
-	var firstPartMsg *tele.Message
-
-	// Upload each part
-	for i, part := range parts {
-		partNum := i + 1
-		statusText := fmt.Sprintf("Video %d/%d: Uploading Part %d/%d: 0%%\n%s | %s",
-			videoNum, totalVideos, partNum, totalParts, result.Title, formatSize(part.FileSize))
-		bs.bot.Edit(statusMsg, statusText)
-
-		file, err := os.Open(part.FilePath)
-		if err != nil {
-			return lastPartMsg, fmt.Errorf("failed to open part %d: %v", partNum, err)
-		}
-
-		// Create progress reader for upload tracking
-		var lastUploadUpdate time.Time
-		var lastUploadPercent float64
-		progressReader := &ProgressReader{
-			reader: file,
-			total:  part.FileSize,
-			onProgress: func(read, total int64) {
-				now := time.Now()
-				percent := float64(read) / float64(total) * 100
-
-				if now.Sub(lastUploadUpdate) < 2*time.Second && percent-lastUploadPercent < 10 {
-					return
-				}
-
-				statusText := fmt.Sprintf("Video %d/%d: Uploading Part %d/%d: %.0f%%\n%s | %s/%s",
-					videoNum, totalVideos, partNum, totalParts, percent, result.Title, formatSize(read), formatSize(total))
-				if _, err := bs.bot.Edit(statusMsg, statusText); err == nil {
-					lastUploadUpdate = now
-					lastUploadPercent = percent
-				}
-			},
-		}
-
-		// Create caption with playlist and part info
-		caption := fmt.Sprintf("%s\n\nVideo %d/%d - Part %d/%d", result.Title, videoNum, totalVideos, partNum, totalParts)
-		partFileName := fmt.Sprintf("%s_part%d.mp4", strings.TrimSuffix(result.FileName, ".mp4"), partNum)
-
-		video := &tele.Video{
-			File:      tele.FromReader(progressReader),
-			FileName:  partFileName,
-			Caption:   caption,
-			Width:     result.Width,
-			Height:    result.Height,
-			Duration:  int(result.Duration),
-			Streaming: true,
-		}
-
-		// Set up send options for threading
-		opts := &tele.SendOptions{}
-		if partNum == 1 {
-			// First part replies to previous video (if any)
-			if replyTo != nil {
-				opts.ReplyTo = replyTo
-			}
-		} else {
-			// Subsequent parts reply to the previous part
-			if lastPartMsg != nil {
-				opts.ReplyTo = lastPartMsg
-			}
-		}
-
-		// Send the video part
-		sentMsg, err := bs.bot.Send(c.Chat(), video, opts)
-		file.Close()
-
-		if err != nil {
-			// Try as document if video fails
-			logger.Warn("Failed to send playlist video part as video, trying as document", "video", videoNum, "part", partNum, "error", err)
-
-			file2, err2 := os.Open(part.FilePath)
-			if err2 != nil {
-				return lastPartMsg, fmt.Errorf("failed to send part %d: %v", partNum, err)
-			}
-
-			doc := &tele.Document{
-				File:     tele.FromReader(file2),
-				FileName: partFileName,
-				Caption:  caption,
-			}
-
-			sentMsg, err = bs.bot.Send(c.Chat(), doc, opts)
-			file2.Close()
-
-			if err != nil {
-				return lastPartMsg, fmt.Errorf("failed to upload part %d: %v", partNum, err)
-			}
-		}
-
-		// Track messages for threading
-		if partNum == 1 {
-			firstPartMsg = sentMsg
-		}
-		lastPartMsg = sentMsg
-
-		logger.Info("Uploaded playlist video part",
-			"video", videoNum,
-			"part", partNum,
-			"totalParts", totalParts,
-			"size", part.FileSize,
-		)
-	}
-
-	// Return the first part message so the next video can reply to it
-	if firstPartMsg != nil {
-		return firstPartMsg, nil
-	}
-	return lastPartMsg, nil
-}
-
-// handleLargeVideo splits and uploads a video that exceeds the size limit
-func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, result *downloader.DownloadResult, url string, progressCb downloader.ProgressCallback) error {
-	numParts := downloader.CalculateNumParts(result.FileSize)
-	bs.bot.Edit(statusMsg, fmt.Sprintf("Video is %s - splitting into %d parts...",
-		formatSize(result.FileSize), numParts))
-
-	// Split the video
-	ctx := context.Background()
-	parts, err := bs.downloader.SplitVideo(ctx, result.FilePath, progressCb)
-	if err != nil {
-		bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to split video: %v", err))
-		return err
-	}
-
-	totalParts := len(parts)
-	var prevMsg *tele.Message
-
-	// Upload each part
-	for i, part := range parts {
-		partNum := i + 1
+	for _, part := range result.Parts {
+		partNum := part.PartNum
 		bs.bot.Edit(statusMsg, fmt.Sprintf("Uploading Part %d/%d: 0%%\n%s | %s",
 			partNum, totalParts, result.Title, formatSize(part.FileSize)))
 
@@ -600,7 +408,6 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 			return err
 		}
 
-		// Create progress reader for upload tracking
 		var lastUploadUpdate time.Time
 		var lastUploadPercent float64
 		progressReader := &ProgressReader{
@@ -609,12 +416,9 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 			onProgress: func(read, total int64) {
 				now := time.Now()
 				percent := float64(read) / float64(total) * 100
-
-				// Rate limit updates: every 2 seconds or every 10%
 				if now.Sub(lastUploadUpdate) < 2*time.Second && percent-lastUploadPercent < 10 {
 					return
 				}
-
 				statusText := fmt.Sprintf("Uploading Part %d/%d: %.0f%%\n%s | %s/%s",
 					partNum, totalParts, percent, result.Title, formatSize(read), formatSize(total))
 				if _, err := bs.bot.Edit(statusMsg, statusText); err == nil {
@@ -624,7 +428,6 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 			},
 		}
 
-		// Create caption with part info
 		caption := fmt.Sprintf("%s\n\nPart %d/%d", result.Title, partNum, totalParts)
 		partFileName := fmt.Sprintf("%s_part%d.mp4", strings.TrimSuffix(result.FileName, ".mp4"), partNum)
 
@@ -638,18 +441,15 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 			Streaming: true,
 		}
 
-		// Set up send options for threading
 		opts := &tele.SendOptions{}
 		if prevMsg != nil {
 			opts.ReplyTo = prevMsg
 		}
 
-		// Send the video part
-		sentMsg, err := bs.bot.Send(c.Chat(), video, opts)
+		sentMsg, err := upload.SendWithRetry(bs.bot, c.Chat(), video, opts)
 		file.Close()
 
 		if err != nil {
-			// Try as document if video fails
 			logger.Warn("Failed to send part as video, trying as document", "part", partNum, "error", err)
 
 			file2, err2 := os.Open(part.FilePath)
@@ -664,7 +464,7 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 				Caption:  caption,
 			}
 
-			sentMsg, err = bs.bot.Send(c.Chat(), doc, opts)
+			sentMsg, err = upload.SendWithRetry(bs.bot, c.Chat(), doc, opts)
 			file2.Close()
 
 			if err != nil {
@@ -673,7 +473,6 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 			}
 		}
 
-		// Use this message as reply target for next part (threading)
 		prevMsg = sentMsg
 
 		logger.Info("Uploaded video part",
@@ -683,11 +482,9 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 		)
 	}
 
-	// Delete status message on success
 	bs.bot.Delete(statusMsg)
 
-	logger.Info("Successfully processed large video",
-		"url", url,
+	logger.Info("Successfully processed split video",
 		"title", result.Title,
 		"totalSize", result.FileSize,
 		"parts", totalParts,
@@ -697,21 +494,18 @@ func (bs *BotService) handleLargeVideo(c tele.Context, statusMsg *tele.Message, 
 	return nil
 }
 
-// uploadSingleVideo uploads a video that doesn't need splitting
-func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message, result *downloader.DownloadResult) error {
-	// Update status for upload phase
-	bs.bot.Edit(statusMsg, fmt.Sprintf("Uploading: 0%%\n%s | %s",
-		result.Title, formatSize(result.FileSize)))
+// uploadPlaylistSingleVideo uploads a single video from a playlist
+func (bs *BotService) uploadPlaylistSingleVideo(c tele.Context, statusMsg *tele.Message, result *engine.ProcessResult, videoNum, totalVideos int, replyTo *tele.Message) (*tele.Message, error) {
+	statusText := fmt.Sprintf("Video %d/%d: Uploading 0%%\n%s | %s",
+		videoNum, totalVideos, result.Title, formatSize(result.FileSize))
+	bs.bot.Edit(statusMsg, statusText)
 
-	// Open the file
 	file, err := os.Open(result.FilePath)
 	if err != nil {
-		bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to open downloaded file: %v", err))
-		return err
+		return nil, fmt.Errorf("failed to open downloaded file: %w", err)
 	}
 	defer file.Close()
 
-	// Create progress reader for upload tracking
 	var lastUploadUpdate time.Time
 	var lastUploadPercent float64
 	progressReader := &ProgressReader{
@@ -720,14 +514,11 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 		onProgress: func(read, total int64) {
 			now := time.Now()
 			percent := float64(read) / float64(total) * 100
-
-			// Rate limit updates: every 2 seconds or every 10%
 			if now.Sub(lastUploadUpdate) < 2*time.Second && percent-lastUploadPercent < 10 {
 				return
 			}
-
-			statusText := fmt.Sprintf("Uploading: %.0f%%\n%s | %s/%s",
-				percent, result.Title, formatSize(read), formatSize(total))
+			statusText := fmt.Sprintf("Video %d/%d: Uploading %.0f%%\n%s | %s/%s",
+				videoNum, totalVideos, percent, result.Title, formatSize(read), formatSize(total))
 			if _, err := bs.bot.Edit(statusMsg, statusText); err == nil {
 				lastUploadUpdate = now
 				lastUploadPercent = percent
@@ -735,54 +526,150 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 		},
 	}
 
-	// Create video with dimensions for proper display
+	caption := fmt.Sprintf("%s\n\nVideo %d/%d", result.Title, videoNum, totalVideos)
 	video := &tele.Video{
 		File:      tele.FromReader(progressReader),
 		FileName:  result.FileName,
-		Caption:   result.Title,
+		Caption:   caption,
 		Width:     result.Width,
 		Height:    result.Height,
 		Duration:  int(result.Duration),
 		Streaming: true,
 	}
 
-	// Send the video
-	_, err = bs.bot.Send(c.Chat(), video)
-	if err != nil {
-		// If video fails, try sending as document
-		logger.Warn("Failed to send as video, trying as document", "error", err)
+	opts := &tele.SendOptions{}
+	if replyTo != nil {
+		opts.ReplyTo = replyTo
+	}
 
-		// Re-open file (reader was consumed)
+	sentMsg, err := upload.SendWithRetry(bs.bot, c.Chat(), video, opts)
+	if err != nil {
+		logger.Warn("Failed to send playlist video as video, trying as document", "video", videoNum, "error", err)
+
 		file2, err2 := os.Open(result.FilePath)
 		if err2 != nil {
-			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to send video: %v", err))
-			return err
+			return nil, fmt.Errorf("failed to send video: %w", err)
 		}
 		defer file2.Close()
 
 		doc := &tele.Document{
 			File:     tele.FromReader(file2),
 			FileName: result.FileName,
-			Caption:  result.Title,
+			Caption:  caption,
 		}
 
-		_, err = bs.bot.Send(c.Chat(), doc)
+		sentMsg, err = upload.SendWithRetry(bs.bot, c.Chat(), doc, opts)
 		if err != nil {
-			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to upload: %v", err))
-			return err
+			return nil, fmt.Errorf("failed to upload: %w", err)
 		}
 	}
 
-	// Delete status message on success
-	bs.bot.Delete(statusMsg)
+	return sentMsg, nil
+}
 
-	logger.Info("Successfully processed video",
-		"title", result.Title,
-		"size", result.FileSize,
-		"user", c.Sender().Username,
-	)
+// uploadPlaylistSplitVideo uploads a split video from a playlist (multiple parts)
+func (bs *BotService) uploadPlaylistSplitVideo(c tele.Context, statusMsg *tele.Message, result *engine.ProcessResult, videoNum, totalVideos int, replyTo *tele.Message) (*tele.Message, error) {
+	totalParts := len(result.Parts)
+	var lastPartMsg *tele.Message
+	var firstPartMsg *tele.Message
 
-	return nil
+	for _, part := range result.Parts {
+		partNum := part.PartNum
+		statusText := fmt.Sprintf("Video %d/%d: Uploading Part %d/%d: 0%%\n%s | %s",
+			videoNum, totalVideos, partNum, totalParts, result.Title, formatSize(part.FileSize))
+		bs.bot.Edit(statusMsg, statusText)
+
+		file, err := os.Open(part.FilePath)
+		if err != nil {
+			return lastPartMsg, fmt.Errorf("failed to open part %d: %v", partNum, err)
+		}
+
+		var lastUploadUpdate time.Time
+		var lastUploadPercent float64
+		progressReader := &ProgressReader{
+			reader: file,
+			total:  part.FileSize,
+			onProgress: func(read, total int64) {
+				now := time.Now()
+				percent := float64(read) / float64(total) * 100
+				if now.Sub(lastUploadUpdate) < 2*time.Second && percent-lastUploadPercent < 10 {
+					return
+				}
+				statusText := fmt.Sprintf("Video %d/%d: Uploading Part %d/%d: %.0f%%\n%s | %s/%s",
+					videoNum, totalVideos, partNum, totalParts, percent, result.Title, formatSize(read), formatSize(total))
+				if _, err := bs.bot.Edit(statusMsg, statusText); err == nil {
+					lastUploadUpdate = now
+					lastUploadPercent = percent
+				}
+			},
+		}
+
+		caption := fmt.Sprintf("%s\n\nVideo %d/%d - Part %d/%d", result.Title, videoNum, totalVideos, partNum, totalParts)
+		partFileName := fmt.Sprintf("%s_part%d.mp4", strings.TrimSuffix(result.FileName, ".mp4"), partNum)
+
+		video := &tele.Video{
+			File:      tele.FromReader(progressReader),
+			FileName:  partFileName,
+			Caption:   caption,
+			Width:     result.Width,
+			Height:    result.Height,
+			Duration:  int(result.Duration),
+			Streaming: true,
+		}
+
+		opts := &tele.SendOptions{}
+		if partNum == 1 {
+			if replyTo != nil {
+				opts.ReplyTo = replyTo
+			}
+		} else {
+			if lastPartMsg != nil {
+				opts.ReplyTo = lastPartMsg
+			}
+		}
+
+		sentMsg, err := upload.SendWithRetry(bs.bot, c.Chat(), video, opts)
+		file.Close()
+
+		if err != nil {
+			logger.Warn("Failed to send playlist video part as video, trying as document", "video", videoNum, "part", partNum, "error", err)
+
+			file2, err2 := os.Open(part.FilePath)
+			if err2 != nil {
+				return lastPartMsg, fmt.Errorf("failed to send part %d: %v", partNum, err)
+			}
+
+			doc := &tele.Document{
+				File:     tele.FromReader(file2),
+				FileName: partFileName,
+				Caption:  caption,
+			}
+
+			sentMsg, err = upload.SendWithRetry(bs.bot, c.Chat(), doc, opts)
+			file2.Close()
+
+			if err != nil {
+				return lastPartMsg, fmt.Errorf("failed to upload part %d: %v", partNum, err)
+			}
+		}
+
+		if partNum == 1 {
+			firstPartMsg = sentMsg
+		}
+		lastPartMsg = sentMsg
+
+		logger.Info("Uploaded playlist video part",
+			"video", videoNum,
+			"part", partNum,
+			"totalParts", totalParts,
+			"size", part.FileSize,
+		)
+	}
+
+	if firstPartMsg != nil {
+		return firstPartMsg, nil
+	}
+	return lastPartMsg, nil
 }
 
 // formatSize formats bytes into human readable format

@@ -133,6 +133,14 @@ func (bs *BotService) handleDL(c tele.Context) error {
 }
 
 func (bs *BotService) handleText(c tele.Context) error {
+	// GENERAL topic guard (Bot API bug #447)
+	if c.Message() != nil && c.Chat() != nil && c.Chat().Type != tele.ChatPrivate {
+		threadID := c.Message().ThreadID
+		if threadID == 0 || threadID == 1 {
+			return c.Send("⚠️ Please send video URLs in a named topic (not General)")
+		}
+	}
+
 	text := c.Text()
 
 	// Extract URLs from the message
@@ -157,7 +165,8 @@ func (bs *BotService) handleText(c tele.Context) error {
 }
 
 func (bs *BotService) processURL(c tele.Context, url string) error {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
 
 	// First check if this is a playlist
 	isPlaylist, playlistInfo, _ := bs.engine.IsPlaylist(ctx, url)
@@ -261,7 +270,8 @@ func (bs *BotService) processPlaylist(c tele.Context, playlistURL string, playli
 		bs.bot.Edit(statusMsg, statusText)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
 	results, err := bs.engine.ProcessPlaylist(ctx, playlistURL, progressCb)
 	if err != nil {
 		bs.bot.Edit(statusMsg, fmt.Sprintf("Playlist download failed: %v", err))

@@ -133,11 +133,14 @@ func (bs *BotService) handleDL(c tele.Context) error {
 }
 
 func (bs *BotService) handleText(c tele.Context) error {
-	// GENERAL topic guard (Bot API bug #447)
-	if c.Message() != nil && c.Chat() != nil && c.Chat().Type != tele.ChatPrivate {
-		threadID := c.Message().ThreadID
-		if threadID == 0 || threadID == 1 {
-			return c.Send("⚠️ Please send video URLs in a named topic (not General)")
+	// In group chats, silently ignore non-URL text (avoid spam)
+	if c.Chat() != nil && c.Chat().Type != tele.ChatPrivate {
+		// GENERAL topic guard (Bot API bug #447) — silently ignore
+		if c.Message() != nil {
+			threadID := c.Message().ThreadID
+			if threadID == 0 || threadID == 1 {
+				return nil
+			}
 		}
 	}
 
@@ -146,8 +149,8 @@ func (bs *BotService) handleText(c tele.Context) error {
 	// Extract URLs from the message
 	urls := downloader.ExtractURLs(text)
 	if len(urls) == 0 {
-		// No URLs found, ignore the message or send help
-		if !strings.HasPrefix(text, "/") {
+		// No URLs found — only send help in private chats
+		if c.Chat() != nil && c.Chat().Type == tele.ChatPrivate && !strings.HasPrefix(text, "/") {
 			return c.Send("No video URL detected. Send me a link to download a video!")
 		}
 		return nil

@@ -68,6 +68,10 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"status":"error","ok":false,"error":"missing required field: url"}`, http.StatusBadRequest)
 		return
 	}
+	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
+		http.Error(w, `{"status":"error","ok":false,"error":"url must use http:// or https:// scheme"}`, http.StatusBadRequest)
+		return
+	}
 	if req.ChatID == 0 {
 		http.Error(w, `{"status":"error","ok":false,"error":"missing required field: chat_id"}`, http.StatusBadRequest)
 		return

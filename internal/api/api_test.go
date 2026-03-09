@@ -185,6 +185,21 @@ func TestWriteJSONResultEvent(t *testing.T) {
 	assert.Equal(t, int64(123456), parsed.FileSize)
 }
 
+func TestInvalidURLScheme(t *testing.T) {
+	svc := newTestService()
+	handler := svc.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/download", strings.NewReader(`{"url":"file:///etc/passwd","chat_id":123}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-secret-token")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Contains(t, w.Body.String(), "http://")
+}
+
 func TestNewAPIService(t *testing.T) {
 	eng := engine.NewEngine()
 	svc := NewAPIService(eng, nil, "my-token")

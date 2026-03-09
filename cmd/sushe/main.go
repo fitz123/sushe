@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"net/http"
 	"os"
@@ -16,7 +17,37 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
+// loadEnvFile reads KEY=VALUE pairs from the given file and sets them
+// as environment variables, but only if they are not already set.
+func loadEnvFile(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.Trim(strings.TrimSpace(val), `"'`)
+		if os.Getenv(key) == "" {
+			os.Setenv(key, val)
+		}
+	}
+}
+
 func main() {
+	// Load .env file (env vars from systemd take precedence)
+	loadEnvFile(".env")
+
 	// Initialize logger
 	logger.Init("debug")
 

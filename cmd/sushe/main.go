@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fitz123/sushe/internal/bot"
+	"github.com/fitz123/sushe/internal/engine"
 	"github.com/fitz123/sushe/internal/logger"
 	tele "gopkg.in/telebot.v3"
 )
@@ -58,8 +59,11 @@ func main() {
 	// Load allowed users whitelist from env
 	allowedUsers := bot.LoadAllowedUsers()
 
+	// Create shared download engine
+	eng := engine.NewEngine()
+
 	// Initialize bot service
-	botService := bot.NewBotService(botInstance, allowedUsers)
+	botService := bot.NewBotService(botInstance, eng, allowedUsers)
 
 	// Start the bot
 	go botService.Start()

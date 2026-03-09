@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,16 +25,26 @@ func main() {
 	}
 
 	// Local Bot API server URL (allows 2GB uploads instead of 50MB)
+	// Also check api_url.txt override file for testing
 	apiURL := os.Getenv("TELEGRAM_API_URL")
 	if apiURL == "" {
 		apiURL = "http://localhost:8081" // Default local Bot API server
+	}
+	if data, err := os.ReadFile("api_url.txt"); err == nil {
+		if override := strings.TrimSpace(string(data)); override != "" {
+			logger.Info("API URL override from api_url.txt", "url", override)
+			apiURL = override
+		}
 	}
 
 	// Initialize the bot with local API server
 	// Custom HTTP client with long timeout for large file uploads (up to 2GB via local Bot API)
 	botPref := tele.Settings{
 		Token:  token,
-		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+		Poller: &tele.LongPoller{
+			Timeout:        10 * time.Second,
+			AllowedUpdates: []string{"message", "edited_message", "channel_post", "callback_query"},
+		},
 		URL:    apiURL,
 		Client: &http.Client{Timeout: 60 * time.Minute},
 	}

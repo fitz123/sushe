@@ -21,12 +21,15 @@ make verify
 ```
 sushe/
 ├── cmd/
-│   ├── sushe/main.go           # Bot entry point
+│   ├── sushe/main.go           # Entry point: Telegram poller + HTTP API server
 │   └── test-split/main.go      # Test utility for video splitting
 ├── internal/
+│   ├── api/api.go              # HTTP API: POST /api/download with bearer auth
 │   ├── bot/bot.go              # Telegram handlers, progress updates, uploads
 │   ├── downloader/downloader.go # yt-dlp wrapper, ffprobe, ffmpeg, splitting
-│   └── logger/logger.go        # Structured logging with slog
+│   ├── engine/engine.go        # Core download+transcode+split engine (no upload)
+│   ├── logger/logger.go        # Structured logging with slog
+│   └── upload/retry.go         # SendWithRetry: 429/FloodError retry helper
 ├── scripts/
 │   ├── deploy.sh               # Full server deployment
 │   ├── update.sh               # Quick binary update
@@ -42,27 +45,50 @@ sushe/
 
 ### Components
 
-1. **Telegram Bot** (`cmd/sushe/main.go`)
+1. **Entry Point** (`cmd/sushe/main.go`)
    - Uses `gopkg.in/telebot.v3`
+   - Starts Telegram LongPoller + HTTP API server (if `SUSHE_API_TOKEN` set)
    - Connects to local Telegram Bot API server for 2GB upload support
-   - Handles URL detection and video processing
+   - Graceful shutdown for both services
 
-2. **Bot Handlers** (`internal/bot/bot.go`)
-   - URL regex matching for video links
-   - Real-time progress updates (download, encode, split, upload phases)
+2. **Engine** (`internal/engine/engine.go`)
+   - Core download+transcode+split pipeline shared by bot and HTTP API
+   - `Process(ctx, url, progressCb)` → `*ProcessResult` (file paths + metadata)
+   - `ProcessPlaylist(ctx, url, progressCb)` → `[]*ProcessResult`
+   - Engine does NOT upload — returns local file paths; callers handle upload via telebot
+
+3. **HTTP API** (`internal/api/api.go`)
+   - `POST /api/download` — download video and send to any Telegram chat/topic
+   - Bearer token auth via `SUSHE_API_TOKEN` env
+   - Streams NDJSON progress events + final result
+   - `GET /health` — service health check
+   - Uses engine for download, telebot `Send()` for upload, `SendWithRetry` for 429 handling
+
+4. **Bot Handlers** (`internal/bot/bot.go`)
+   - `/dl` command + URL auto-detect in messages
+   - Real-time progress updates via Telegram message editing
    - Multi-part upload with threaded replies
-   - `ProgressReader` for upload progress tracking
+   - Delegates download to engine, keeps telebot upload logic
+   - GENERAL topic guard (ThreadID == 0/1 → warning)
 
-3. **Downloader** (`internal/downloader/downloader.go`)
+5. **Downloader** (`internal/downloader/downloader.go`)
    - yt-dlp wrapper with format selection preferring H.264
    - Codec detection via ffprobe
    - Conditional re-encoding (VP9/AV1 → H.264) via ffmpeg
    - Video splitting for files >1.9GB
 
+6. **Upload Retry** (`internal/upload/retry.go`)
+   - `SendWithRetry()` wraps telebot `Send()` with 429/FloodError handling
+   - Max 3 retries, sleeps for `RetryAfter` seconds
+   - Used by both bot handlers and HTTP API
+
 ### Video Processing Flow
 
 ```
-URL → yt-dlp download → Check codec → Re-encode if needed → Split if >1.9GB → Upload to Telegram
+URL → Engine.Process() → yt-dlp download → codec check (ffprobe)
+    → re-encode if needed (ffmpeg) → split if >1.9GB → ProcessResult
+    ↓ Bot mode: telebot sendInThread (with progress message editing)
+    ↓ HTTP API: telebot Send + NDJSON progress stream to caller
 ```
 
 ### Codec Handling
@@ -77,6 +103,36 @@ bestvideo[height<=1080]+bestaudio/best
 ```
 
 **Post-download**: If codec is not H.264, re-encode with ffmpeg.
+
+## HTTP API
+
+`POST /api/download` — download video and send to a Telegram chat/topic.
+
+- **Auth:** `Authorization: Bearer <SUSHE_API_TOKEN>` header
+- **Port:** `SUSHE_API_PORT` env (default `8082`)
+- **Enabled when:** `SUSHE_API_TOKEN` env is set (no token = bot-only mode)
+
+**Request:**
+```json
+{"url": "https://youtube.com/watch?v=...", "chat_id": -1003894624477, "thread_id": 120}
+```
+
+**Response** (`Content-Type: application/x-ndjson`, streamed):
+```
+{"status":"started","url":"..."}
+{"status":"downloading","percent":45.2}
+{"status":"encoding","percent":80.0,"codec":"vp9"}
+{"status":"splitting","part":1,"total":3}
+{"status":"uploading","part":1,"total":1}
+{"status":"done","ok":true,"title":"Video Title","message_id":789,"file_size":123456}
+```
+
+**Errors:**
+- `401` — missing or invalid bearer token
+- `400` — missing `url` or `chat_id`
+- NDJSON `{"status":"error","ok":false,"error":"..."}` for download/upload failures
+
+**Health check:** `GET /health` → `OK`
 
 ## Deployment
 
@@ -100,7 +156,27 @@ TELEGRAM_API_HASH=your_api_hash
 SSH_PUBLIC_KEY=your_ssh_public_key
 ```
 
+Optional (enables HTTP API):
+```
+SUSHE_API_TOKEN=your_api_token    # Bearer token for POST /api/download
+SUSHE_API_PORT=8082               # HTTP API port (default: 8082)
+```
+
 ## Key Functions
+
+### engine.go
+
+- `NewEngine()` - Create engine with downloader instance
+- `Process(ctx, url, progressCb)` - Download + codec check + transcode + split → ProcessResult
+- `ProcessPlaylist(ctx, url, progressCb)` - Process playlist → []ProcessResult
+- `IsPlaylist(ctx, url)` - Check if URL is a playlist
+- `Cleanup(result)` - Remove work directory
+
+### api.go
+
+- `NewAPIService(engine, bot, token)` - Create API service
+- `Handler()` - Returns http.Handler with routes
+- `handleDownload(w, r)` - POST /api/download handler (auth + engine + upload + NDJSON stream)
 
 ### downloader.go
 
@@ -113,9 +189,14 @@ SSH_PUBLIC_KEY=your_ssh_public_key
 
 ### bot.go
 
-- `handleMessage()` - Main URL handler
+- `processURL()` - Download via engine + upload via telebot
+- `processPlaylist()` - Playlist processing via engine
 - `updateProgress()` - Rate-limited status updates
 - `ProgressReader` - io.Reader wrapper for upload progress
+
+### upload/retry.go
+
+- `SendWithRetry(bot, to, what, opts)` - Send with 429/FloodError retry (max 3)
 
 ## Progress Phases
 

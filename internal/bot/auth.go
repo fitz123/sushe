@@ -51,20 +51,15 @@ func AuthMiddleware(allowedUsers AllowedUsers) tele.MiddlewareFunc {
 	return func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
 
-			// Debug: log ALL incoming updates
 			sender := c.Sender()
 			chat := c.Chat()
 			if sender != nil && chat != nil {
-				logger.Info("DEBUG incoming update",
+				logger.Debug("incoming update",
 					"sender_id", sender.ID,
 					"username", sender.Username,
-					"is_bot", sender.IsBot,
 					"chat_id", chat.ID,
 					"chat_type", string(chat.Type),
-					"text", c.Text(),
 				)
-			} else {
-				logger.Info("DEBUG incoming update with nil sender/chat")
 			}
 
 			if sender == nil {

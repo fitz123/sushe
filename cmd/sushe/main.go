@@ -113,8 +113,9 @@ func main() {
 	if apiToken != "" {
 		apiService := api.NewAPIService(eng, botInstance, apiToken)
 		httpServer = &http.Server{
-			Addr:    ":" + apiPort,
-			Handler: apiService.Handler(),
+			Addr:              ":" + apiPort,
+			Handler:           apiService.Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
 		}
 		go func() {
 			logger.Info("HTTP API server starting", "port", apiPort)

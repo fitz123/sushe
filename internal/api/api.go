@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -50,12 +51,13 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	// Auth check
 	authHeader := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authHeader, "Bearer ") || authHeader[7:] != s.token {
+	if !strings.HasPrefix(authHeader, "Bearer ") || subtle.ConstantTimeCompare([]byte(authHeader[7:]), []byte(s.token)) != 1 {
 		http.Error(w, `{"status":"error","ok":false,"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
 
-	// Parse request
+	// Parse request (limit body to 1MB to prevent DoS)
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req DownloadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"status":"error","ok":false,"error":"invalid JSON body"}`, http.StatusBadRequest)

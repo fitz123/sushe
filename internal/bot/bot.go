@@ -166,7 +166,7 @@ func (bs *BotService) processURL(c tele.Context, url string) error {
 	}
 
 	// Not a playlist, process as single video
-	statusMsg, err := bs.bot.Send(c.Chat(), "Starting download...")
+	statusMsg, err := bs.bot.Send(c.Chat(), "Starting download...", &tele.SendOptions{ThreadID: c.Message().ThreadID})
 	if err != nil {
 		return err
 	}
@@ -240,7 +240,7 @@ func (bs *BotService) processURL(c tele.Context, url string) error {
 // processPlaylist handles downloading and uploading playlist videos
 func (bs *BotService) processPlaylist(c tele.Context, playlistURL string, playlistInfo *downloader.PlaylistInfo) error {
 	playlistMsg := fmt.Sprintf("Playlist: %s — %d videos", playlistInfo.Title, playlistInfo.PlaylistCount)
-	statusMsg, err := bs.bot.Send(c.Chat(), playlistMsg)
+	statusMsg, err := bs.bot.Send(c.Chat(), playlistMsg, &tele.SendOptions{ThreadID: c.Message().ThreadID})
 	if err != nil {
 		return err
 	}
@@ -317,6 +317,7 @@ func (bs *BotService) processPlaylist(c tele.Context, playlistURL string, playli
 
 // uploadSingleVideo uploads a non-split video result
 func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message, result *engine.ProcessResult) error {
+	sendOpts := &tele.SendOptions{ThreadID: c.Message().ThreadID}
 	bs.bot.Edit(statusMsg, fmt.Sprintf("Uploading: 0%%\n%s | %s",
 		result.Title, formatSize(result.FileSize)))
 
@@ -357,7 +358,7 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 		Streaming: true,
 	}
 
-	_, err = upload.SendWithRetry(bs.bot, c.Chat(), video)
+	_, err = upload.SendWithRetry(bs.bot, c.Chat(), video, sendOpts)
 	if err != nil {
 		logger.Warn("Failed to send as video, trying as document", "error", err)
 
@@ -374,7 +375,7 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 			Caption:  result.Title,
 		}
 
-		_, err = upload.SendWithRetry(bs.bot, c.Chat(), doc)
+		_, err = upload.SendWithRetry(bs.bot, c.Chat(), doc, sendOpts)
 		if err != nil {
 			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to upload: %v", err))
 			return err
@@ -441,7 +442,7 @@ func (bs *BotService) uploadSplitVideo(c tele.Context, statusMsg *tele.Message, 
 			Streaming: true,
 		}
 
-		opts := &tele.SendOptions{}
+		opts := &tele.SendOptions{ThreadID: c.Message().ThreadID}
 		if prevMsg != nil {
 			opts.ReplyTo = prevMsg
 		}
@@ -537,7 +538,7 @@ func (bs *BotService) uploadPlaylistSingleVideo(c tele.Context, statusMsg *tele.
 		Streaming: true,
 	}
 
-	opts := &tele.SendOptions{}
+	opts := &tele.SendOptions{ThreadID: c.Message().ThreadID}
 	if replyTo != nil {
 		opts.ReplyTo = replyTo
 	}
@@ -617,7 +618,7 @@ func (bs *BotService) uploadPlaylistSplitVideo(c tele.Context, statusMsg *tele.M
 			Streaming: true,
 		}
 
-		opts := &tele.SendOptions{}
+		opts := &tele.SendOptions{ThreadID: c.Message().ThreadID}
 		if partNum == 1 {
 			if replyTo != nil {
 				opts.ReplyTo = replyTo

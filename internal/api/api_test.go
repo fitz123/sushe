@@ -206,6 +206,7 @@ func TestNewAPIService(t *testing.T) {
 	assert.NotNil(t, svc)
 	assert.Equal(t, "my-token", svc.token)
 	assert.NotNil(t, svc.engine)
+	assert.NotNil(t, svc.dedup)
 }
 
 func TestAuthBearerFormat(t *testing.T) {

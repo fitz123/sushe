@@ -7,6 +7,9 @@ import (
 
 const dedupTTL = 15 * time.Minute
 
+// cleanupInterval controls how often the background goroutine sweeps expired entries.
+const cleanupInterval = 5 * time.Minute
+
 type dedupEntry struct {
 	status  string // "in_progress" or "completed"
 	result  *ResultEvent
@@ -14,11 +17,39 @@ type dedupEntry struct {
 }
 
 type dedupGuard struct {
-	entries sync.Map
+	mu      sync.Mutex
+	entries map[string]*dedupEntry
+	stopCh  chan struct{}
 }
 
 func newDedupGuard() *dedupGuard {
-	return &dedupGuard{}
+	d := &dedupGuard{
+		entries: make(map[string]*dedupEntry),
+		stopCh:  make(chan struct{}),
+	}
+	go d.cleanupLoop()
+	return d
+}
+
+// cleanupLoop periodically removes expired entries to prevent unbounded memory growth.
+func (d *dedupGuard) cleanupLoop() {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			d.mu.Lock()
+			now := time.Now()
+			for key, entry := range d.entries {
+				if now.Sub(entry.created) > dedupTTL {
+					delete(d.entries, key)
+				}
+			}
+			d.mu.Unlock()
+		case <-d.stopCh:
+			return
+		}
+	}
 }
 
 // TryAcquire attempts to acquire the dedup lock for the given key.
@@ -27,39 +58,43 @@ func newDedupGuard() *dedupGuard {
 //   - (result, false)       — completed cache hit, caller should return cached result
 //   - (nil, false)          — in-progress, caller should return 409
 func (d *dedupGuard) TryAcquire(key string) (cachedResult *ResultEvent, acquired bool) {
-	for {
-		entry := &dedupEntry{status: "in_progress", created: time.Now()}
-		actual, loaded := d.entries.LoadOrStore(key, entry)
-		if !loaded {
-			return nil, true
-		}
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
-		existing := actual.(*dedupEntry)
-		if time.Since(existing.created) > dedupTTL {
-			// Expired — delete and retry
-			d.entries.Delete(key)
-			continue
-		}
-
-		if existing.status == "completed" {
-			return existing.result, false
-		}
-
-		// In-progress, not expired
-		return nil, false
+	existing, ok := d.entries[key]
+	if !ok {
+		d.entries[key] = &dedupEntry{status: "in_progress", created: time.Now()}
+		return nil, true
 	}
+
+	if time.Since(existing.created) > dedupTTL {
+		// Expired — replace with fresh in-progress entry
+		d.entries[key] = &dedupEntry{status: "in_progress", created: time.Now()}
+		return nil, true
+	}
+
+	if existing.status == "completed" {
+		return existing.result, false
+	}
+
+	// In-progress, not expired
+	return nil, false
 }
 
 // Complete marks the key as completed with the given result and resets the TTL.
 func (d *dedupGuard) Complete(key string, result *ResultEvent) {
-	d.entries.Store(key, &dedupEntry{
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.entries[key] = &dedupEntry{
 		status:  "completed",
 		result:  result,
 		created: time.Now(),
-	})
+	}
 }
 
 // Release removes the key, allowing future retries after a failure.
 func (d *dedupGuard) Release(key string) {
-	d.entries.Delete(key)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.entries, key)
 }

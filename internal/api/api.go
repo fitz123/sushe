@@ -120,6 +120,7 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		s.dedup.Release(dedupKey)
 		http.Error(w, `{"status":"error","ok":false,"error":"streaming not supported"}`, http.StatusInternalServerError)
 		return
 	}
@@ -151,6 +152,8 @@ func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWr
 			s.dedup.Release(dedupKey)
 		} else if finalResult != nil {
 			s.dedup.Complete(dedupKey, finalResult)
+		} else {
+			s.dedup.Release(dedupKey) // Safety: release if neither set
 		}
 	}()
 
@@ -200,6 +203,8 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 			s.dedup.Release(dedupKey)
 		} else if finalResult != nil {
 			s.dedup.Complete(dedupKey, finalResult)
+		} else {
+			s.dedup.Release(dedupKey) // Safety: release if neither set
 		}
 	}()
 
@@ -220,6 +225,7 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 	}
 
 	var lastMsgID int
+	var uploadedCount int
 	for i, result := range results {
 		videoNum := i + 1
 		writeJSON(w, flusher, ProgressEvent{
@@ -241,6 +247,13 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 			continue
 		}
 		lastMsgID = msgID
+		uploadedCount++
+	}
+
+	if uploadedCount == 0 {
+		handleErr = fmt.Errorf("all %d playlist uploads failed", len(results))
+		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: handleErr.Error()})
+		return
 	}
 
 	finalResult = &ResultEvent{

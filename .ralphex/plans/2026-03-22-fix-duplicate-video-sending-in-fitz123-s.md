@@ -163,7 +163,7 @@ Use plain string concatenation: `url + "|" + strconv.FormatInt(chatID, 10) + "|"
 
 #### Dedup data structure
 
-- [ ] Create `internal/api/dedup.go` with a `dedupGuard` struct containing:
+- [x] Create `internal/api/dedup.go` with a `dedupGuard` struct containing:
   - A `sync.Map` keyed by the concatenated string key (see format above)
   - Entry struct: `type dedupEntry struct { status string; result *ResultEvent; created time.Time }` — status is `"in_progress"` or `"completed"`
   - Constructor: `func newDedupGuard() *dedupGuard`
@@ -181,20 +181,20 @@ Use plain string concatenation: `url + "|" + strconv.FormatInt(chatID, 10) + "|"
 
 #### Wiring into handleDownload
 
-- [ ] In `api.go`, add a `dedup *dedupGuard` field to `APIService` struct
-- [ ] In `NewAPIService()`, initialize `dedup: newDedupGuard()`
-- [ ] In `handleDownload()`, after request parsing and validation (after line 83, before streaming headers at line 85): compute dedup key: `dedupKey := req.URL + "|" + strconv.FormatInt(req.ChatID, 10) + "|" + strconv.Itoa(req.ThreadID)`
-- [ ] Call `cachedResult, acquired := s.dedup.TryAcquire(dedupKey)`
-- [ ] If `cachedResult != nil` (completed, cache hit): set the same streaming headers already used by `handleDownload` (read the existing header-setting code at api.go lines 86-88 and replicate: `Content-Type: application/x-ndjson`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`), then write only the final `ResultEvent` as a single NDJSON line (no progress events — client should handle a cache-hit response having no progress stream), then return. Add a code comment: `// Cache hit: return only the final ResultEvent, no progress events`
-- [ ] If `!acquired && cachedResult == nil` (in-progress): respond with `http.Error(w, '{"status":"error","ok":false,"error":"duplicate request in progress"}', http.StatusConflict)` and return
-- [ ] If `acquired`: proceed with normal handling, passing `dedupKey` to sub-handlers
+- [x] In `api.go`, add a `dedup *dedupGuard` field to `APIService` struct
+- [x] In `NewAPIService()`, initialize `dedup: newDedupGuard()`
+- [x] In `handleDownload()`, after request parsing and validation (after line 83, before streaming headers at line 85): compute dedup key: `dedupKey := req.URL + "|" + strconv.FormatInt(req.ChatID, 10) + "|" + strconv.Itoa(req.ThreadID)`
+- [x] Call `cachedResult, acquired := s.dedup.TryAcquire(dedupKey)`
+- [x] If `cachedResult != nil` (completed, cache hit): set the same streaming headers already used by `handleDownload` (read the existing header-setting code at api.go lines 86-88 and replicate: `Content-Type: application/x-ndjson`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`), then write only the final `ResultEvent` as a single NDJSON line (no progress events — client should handle a cache-hit response having no progress stream), then return. Add a code comment: `// Cache hit: return only the final ResultEvent, no progress events`
+- [x] If `!acquired && cachedResult == nil` (in-progress): respond with `http.Error(w, '{"status":"error","ok":false,"error":"duplicate request in progress"}', http.StatusConflict)` and return
+- [x] If `acquired`: proceed with normal handling, passing `dedupKey` to sub-handlers
 
 #### Wiring into sub-handlers (dedup key flow)
 
-- [ ] Change `handleSingleDownload` signature to accept an additional `dedupKey string` parameter: `func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, dedupKey string)`
-- [ ] Change `handlePlaylistDownload` signature to accept an additional `dedupKey string` parameter: `func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, info interface{}, dedupKey string)`
-- [ ] Update the call sites in `handleDownload` to pass `dedupKey`
-- [ ] In `handleSingleDownload`: use `defer` with error-check pattern for dedup lifecycle:
+- [x] Change `handleSingleDownload` signature to accept an additional `dedupKey string` parameter: `func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, dedupKey string)`
+- [x] Change `handlePlaylistDownload` signature to accept an additional `dedupKey string` parameter: `func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, info interface{}, dedupKey string)`
+- [x] Update the call sites in `handleDownload` to pass `dedupKey`
+- [x] In `handleSingleDownload`: use `defer` with error-check pattern for dedup lifecycle:
   ```go
   var finalResult *ResultEvent
   var handleErr error
@@ -207,8 +207,8 @@ Use plain string concatenation: `url + "|" + strconv.FormatInt(chatID, 10) + "|"
   }()
   ```
   Then set `finalResult` to the `&ResultEvent{...}` just before writing it at the success path (lines 141-147). Set `handleErr` on error returns.
-- [ ] In `handlePlaylistDownload`: same defer pattern. Set `finalResult` to the final `&ResultEvent{...}` at line 191-196 success path. Set `handleErr` on error at line 163.
-- [ ] Verify that all error return paths in both functions result in `Release()` being called (via the defer)
+- [x] In `handlePlaylistDownload`: same defer pattern. Set `finalResult` to the final `&ResultEvent{...}` at line 191-196 success path. Set `handleErr` on error at line 163.
+- [x] Verify that all error return paths in both functions result in `Release()` being called (via the defer)
 
 #### Cached response behavior (documented)
 
@@ -216,14 +216,14 @@ When `TryAcquire` returns a cached result, the response contains **only** the fi
 
 #### Tests
 
-- [ ] Write tests in `internal/api/dedup_test.go`:
+- [x] Write tests in `internal/api/dedup_test.go`:
   - Test: `TryAcquire` on new key returns `(nil, true)` — acquired
   - Test: `TryAcquire` on in-progress key returns `(nil, false)` — rejected
   - Test: `Complete` then `TryAcquire` returns `(cachedResult, false)` with correct data
   - Test: `Release` then `TryAcquire` returns `(nil, true)` — re-acquired after failure
   - Test: expired entries are cleaned up (set short TTL or manipulate `created` time directly on the entry)
   - Test: **concurrent access** — use a starting gate pattern for true concurrency: create a `sync.WaitGroup` and a `start` channel, launch 10 goroutines that each call `wg.Done()` then block on `<-start`, close the `start` channel to release all goroutines simultaneously, each goroutine calls `TryAcquire` with the same key. Verify exactly one returns `acquired=true` and the other 9 get `acquired=false`. This pattern with `-race` flag provides meaningful concurrency coverage.
-- [ ] Run tests: `go test ./internal/api/ -race`
+- [x] Run tests: `go test ./internal/api/ -race`
 
 ### Task 5: Verify acceptance criteria [HIGH]
 

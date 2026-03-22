@@ -227,14 +227,14 @@ When `TryAcquire` returns a cached result, the response contains **only** the fi
 
 ### Task 5: Verify acceptance criteria [HIGH]
 
-- [ ] Verify all 6 upload functions use `tele.FromURL("file://" + path)` — no `FromReader` or `FromDisk` remains in bot.go or api.go
-- [ ] Verify zero `tele.Document` references remain in bot.go and api.go
-- [ ] Verify `ProgressReader` struct is removed from bot.go
-- [ ] Verify dedup guard exists and is wired into `handleDownload`
-- [ ] Run full test suite: `cd >>/REPO_ROOT && go test ./... -race`
-- [ ] Run linter: `cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...`
-- [ ] Verify build: `cd >>/REPO_ROOT && go build ./cmd/sushe/`
-- [ ] Grep for leftover Document/FromReader/FromDisk in upload paths to confirm clean removal
+- [x] Verify all 6 upload functions use `tele.FromURL("file://" + path)` — no `FromReader` or `FromDisk` remains in bot.go or api.go
+- [x] Verify zero `tele.Document` references remain in bot.go and api.go
+- [x] Verify `ProgressReader` struct is removed from bot.go
+- [x] Verify dedup guard exists and is wired into `handleDownload`
+- [x] Run full test suite: `cd >>/REPO_ROOT && go test ./... -race`
+- [x] Run linter: `cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...`
+- [x] Verify build: `cd >>/REPO_ROOT && go build ./cmd/sushe/`
+- [x] Grep for leftover Document/FromReader/FromDisk in upload paths to confirm clean removal
 
 ### Task 6: Update documentation [HIGH]
 

@@ -17,14 +17,16 @@ func init() {
 	logger.Init("error")
 }
 
-func newTestService() *APIService {
+func newTestService(t *testing.T) *APIService {
 	// Create API service with nil bot (tests that don't upload won't need it)
 	eng := engine.NewEngine()
-	return NewAPIService(eng, nil, "test-secret-token")
+	svc := NewAPIService(eng, nil, "test-secret-token")
+	t.Cleanup(func() { svc.Close() })
+	return svc
 }
 
 func TestAuthMissingToken(t *testing.T) {
-	svc := newTestService()
+	svc := newTestService(t)
 	handler := svc.Handler()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/download", strings.NewReader(`{"url":"https://example.com","chat_id":123}`))
@@ -38,7 +40,7 @@ func TestAuthMissingToken(t *testing.T) {
 }
 
 func TestAuthWrongToken(t *testing.T) {
-	svc := newTestService()
+	svc := newTestService(t)
 	handler := svc.Handler()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/download", strings.NewReader(`{"url":"https://example.com","chat_id":123}`))
@@ -53,7 +55,7 @@ func TestAuthWrongToken(t *testing.T) {
 }
 
 func TestAuthCorrectTokenProceeds(t *testing.T) {
-	svc := newTestService()
+	svc := newTestService(t)
 	handler := svc.Handler()
 
 	// With correct token but missing url — should get 400, not 401
@@ -69,7 +71,7 @@ func TestAuthCorrectTokenProceeds(t *testing.T) {
 }
 
 func TestMissingURL(t *testing.T) {
-	svc := newTestService()
+	svc := newTestService(t)
 	handler := svc.Handler()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/download", strings.NewReader(`{"chat_id":123}`))
@@ -84,7 +86,7 @@ func TestMissingURL(t *testing.T) {
 }
 
 func TestMissingChatID(t *testing.T) {
-	svc := newTestService()
+	svc := newTestService(t)
 	handler := svc.Handler()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/download", strings.NewReader(`{"url":"https://example.com"}`))
@@ -99,7 +101,7 @@ func TestMissingChatID(t *testing.T) {
 }
 
 func TestInvalidJSON(t *testing.T) {
-	svc := newTestService()
+	svc := newTestService(t)
 	handler := svc.Handler()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/download", strings.NewReader(`not json`))
@@ -114,7 +116,7 @@ func TestInvalidJSON(t *testing.T) {
 }
 
 func TestMethodNotAllowed(t *testing.T) {
-	svc := newTestService()
+	svc := newTestService(t)
 	handler := svc.Handler()
 
 	req := httptest.NewRequest(http.MethodGet, "/api/download", nil)
@@ -126,7 +128,7 @@ func TestMethodNotAllowed(t *testing.T) {
 }
 
 func TestHealthEndpoint(t *testing.T) {
-	svc := newTestService()
+	svc := newTestService(t)
 	handler := svc.Handler()
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -186,7 +188,7 @@ func TestWriteJSONResultEvent(t *testing.T) {
 }
 
 func TestInvalidURLScheme(t *testing.T) {
-	svc := newTestService()
+	svc := newTestService(t)
 	handler := svc.Handler()
 
 	req := httptest.NewRequest(http.MethodPost, "/api/download", strings.NewReader(`{"url":"file:///etc/passwd","chat_id":123}`))
@@ -210,7 +212,7 @@ func TestNewAPIService(t *testing.T) {
 }
 
 func TestAuthBearerFormat(t *testing.T) {
-	svc := newTestService()
+	svc := newTestService(t)
 	handler := svc.Handler()
 
 	// Token without "Bearer " prefix should fail

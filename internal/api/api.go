@@ -270,7 +270,7 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 		MessageID: lastMsgID,
 	}
 	// Only cache fully successful playlists. Partial failures release the dedup key
-	// so the client can retry and deliver the missing videos.
+	// (via the else branch in defer) so the client can retry for missing videos.
 	if uploadedCount == len(results) {
 		finalResult = result
 	}

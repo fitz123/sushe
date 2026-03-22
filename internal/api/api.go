@@ -46,6 +46,13 @@ func (s *APIService) Handler() http.Handler {
 }
 
 // handleDownload processes POST /api/download requests.
+//
+// Dedup guard: requests are deduplicated by (url, chat_id, thread_id) key.
+// If an identical request is already in progress, returns 409 Conflict.
+// If an identical request completed within the TTL (15 minutes, matching
+// the context timeout), returns the cached ResultEvent as a single NDJSON
+// line with no preceding progress events. On failure, the key is released
+// so the client can retry.
 func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -262,6 +269,8 @@ func (s *APIService) uploadResult(result *engine.ProcessResult, req DownloadRequ
 }
 
 // uploadSingleFile uploads a single video file.
+// Uses file:// URI so the local Bot API server reads directly from disk,
+// avoiding HTTP multipart upload timeouts/EOF on large files.
 func (s *APIService) uploadSingleFile(result *engine.ProcessResult, filePath, fileName, caption string, recipient tele.Recipient, opts *tele.SendOptions) (int, error) {
 	video := &tele.Video{
 		File:      tele.FromURL("file://" + filePath),
@@ -282,6 +291,7 @@ func (s *APIService) uploadSingleFile(result *engine.ProcessResult, filePath, fi
 }
 
 // uploadSplitParts uploads split video parts sequentially, threading each as a reply.
+// Uses file:// URI so the local Bot API server reads directly from disk.
 func (s *APIService) uploadSplitParts(result *engine.ProcessResult, recipient tele.Recipient, baseOpts *tele.SendOptions) (int, error) {
 	var firstMsgID int
 	var prevMsg *tele.Message

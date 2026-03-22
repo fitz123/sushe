@@ -99,7 +99,7 @@ cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...
 - [x] Read telebot `file.go` to verify `FromURL()` sets `FileURL` field on the `File` struct
 - [x] Read telebot `api.go` `sendFiles()` function to verify: when `FileURL` is set, it goes into `params` map (not `rawFiles`), and when `rawFiles` is empty, `b.Raw()` is called (JSON POST, no multipart)
 - [x] If the code path confirms JSON POST for `FromURL`: document findings as a comment in the PR description
-- [ ] If the code path does NOT confirm JSON POST for `FromURL`, pursue fallback approaches in order:
+- [x] If the code path does NOT confirm JSON POST for `FromURL`, pursue fallback approaches in order: (N/A — verification confirmed JSON POST path)
   - (a) Check if telebot's `params` map can be set directly to pass `"file:///path"` as the video field string, bypassing `FromURL` — e.g., via `video.File = tele.File{FileURL: "file:///path"}` or manipulating `sendFiles` input
   - (b) Patch telebot locally (Go module replace directive) to handle `file://` URLs as URL parameters
   - (c) If neither works, STOP and escalate to user for re-planning — the `file://` approach is not viable without telebot cooperation
@@ -238,10 +238,10 @@ When `TryAcquire` returns a cached result, the response contains **only** the fi
 
 ### Task 6: Update documentation [HIGH]
 
-- [ ] Update README.md (if it documents the upload mechanism or Document fallback behavior) to reflect `file://` URI approach
-- [ ] Add comment in `api.go` above `handleDownload` explaining the dedup guard: purpose, TTL (15 minutes, matching context timeout), cached response format (single ResultEvent, no progress events)
-- [ ] Add comment in bot.go upload functions explaining why `FromURL` with `file://` is used (local Bot API reads from disk, avoids HTTP timeout/EOF on large files)
-- [ ] Update or create entries in GitHub issues #6 and #7 referencing the fix PR
+- [x] Update README.md (if it documents the upload mechanism or Document fallback behavior) to reflect `file://` URI approach
+- [x] Add comment in `api.go` above `handleDownload` explaining the dedup guard: purpose, TTL (15 minutes, matching context timeout), cached response format (single ResultEvent, no progress events)
+- [x] Add comment in bot.go upload functions explaining why `FromURL` with `file://` is used (local Bot API reads from disk, avoids HTTP timeout/EOF on large files)
+- [x] Update or create entries in GitHub issues #6 and #7 referencing the fix PR
 
 ## Revision Diff
 

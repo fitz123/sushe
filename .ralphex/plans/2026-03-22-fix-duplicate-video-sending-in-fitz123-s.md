@@ -139,14 +139,14 @@ cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...
 **Files:**
 - Modify: `internal/api/api.go`
 
-- [ ] In `uploadSingleFile()` (line 218): replace `tele.FromDisk(filePath)` with `tele.FromURL("file://" + filePath)` in the Video struct
-- [ ] In `uploadSingleFile()`: remove Document fallback block (lines 228-240): the `if err != nil` block that creates tele.Document with FromDisk and retries
-- [ ] In `uploadSingleFile()`: after removing fallback, return `0, err` directly on SendWithRetry failure
-- [ ] In `uploadSplitParts()` (line 255): replace `tele.FromDisk(part.FilePath)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
-- [ ] In `uploadSplitParts()`: remove Document fallback block (lines 272-285)
-- [ ] In `uploadSplitParts()`: after removing fallback, return error directly on failure
-- [ ] Run `goimports` to clean up any unused imports
-- [ ] Verify build: `go build ./internal/api/`
+- [x] In `uploadSingleFile()` (line 218): replace `tele.FromDisk(filePath)` with `tele.FromURL("file://" + filePath)` in the Video struct
+- [x] In `uploadSingleFile()`: remove Document fallback block (lines 228-240): the `if err != nil` block that creates tele.Document with FromDisk and retries
+- [x] In `uploadSingleFile()`: after removing fallback, return `0, err` directly on SendWithRetry failure
+- [x] In `uploadSplitParts()` (line 255): replace `tele.FromDisk(part.FilePath)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
+- [x] In `uploadSplitParts()`: remove Document fallback block (lines 272-285)
+- [x] In `uploadSplitParts()`: after removing fallback, return error directly on failure
+- [x] Run `goimports` to clean up any unused imports
+- [x] Verify build: `go build ./internal/api/`
 
 ### Task 4: Add API dedup guard for `/api/download` [HIGH]
 

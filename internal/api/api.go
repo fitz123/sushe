@@ -215,7 +215,7 @@ func (s *APIService) uploadResult(result *engine.ProcessResult, req DownloadRequ
 // uploadSingleFile uploads a single video file.
 func (s *APIService) uploadSingleFile(result *engine.ProcessResult, filePath, fileName, caption string, recipient tele.Recipient, opts *tele.SendOptions) (int, error) {
 	video := &tele.Video{
-		File:      tele.FromDisk(filePath),
+		File:      tele.FromURL("file://" + filePath),
 		FileName:  fileName,
 		Caption:   caption,
 		Width:     result.Width,
@@ -226,17 +226,7 @@ func (s *APIService) uploadSingleFile(result *engine.ProcessResult, filePath, fi
 
 	msg, err := upload.SendWithRetry(s.bot, recipient, video, opts)
 	if err != nil {
-		// Fallback to document
-		logger.Warn("Video send failed, trying document fallback", "error", err)
-		doc := &tele.Document{
-			File:     tele.FromDisk(filePath),
-			FileName: fileName,
-			Caption:  caption,
-		}
-		msg, err = upload.SendWithRetry(s.bot, recipient, doc, opts)
-		if err != nil {
-			return 0, err
-		}
+		return 0, err
 	}
 
 	return msg.ID, nil
@@ -252,7 +242,7 @@ func (s *APIService) uploadSplitParts(result *engine.ProcessResult, recipient te
 		partFileName := fmt.Sprintf("%s_part%d.mp4", strings.TrimSuffix(result.FileName, ".mp4"), part.PartNum)
 
 		video := &tele.Video{
-			File:      tele.FromDisk(part.FilePath),
+			File:      tele.FromURL("file://" + part.FilePath),
 			FileName:  partFileName,
 			Caption:   caption,
 			Width:     result.Width,
@@ -271,17 +261,7 @@ func (s *APIService) uploadSplitParts(result *engine.ProcessResult, recipient te
 
 		msg, err := upload.SendWithRetry(s.bot, recipient, video, opts)
 		if err != nil {
-			// Fallback to document
-			logger.Warn("Split part video send failed, trying document", "part", part.PartNum, "error", err)
-			doc := &tele.Document{
-				File:     tele.FromDisk(part.FilePath),
-				FileName: partFileName,
-				Caption:  caption,
-			}
-			msg, err = upload.SendWithRetry(s.bot, recipient, doc, opts)
-			if err != nil {
-				return firstMsgID, fmt.Errorf("failed to upload part %d: %w", part.PartNum, err)
-			}
+			return firstMsgID, fmt.Errorf("failed to upload part %d: %w", part.PartNum, err)
 		}
 
 		if part.PartNum == 1 {

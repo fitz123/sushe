@@ -96,9 +96,9 @@ cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...
 - Read only: `~/go/pkg/mod/gopkg.in/telebot.v3@v3.3.8/api.go` (telebot source in module cache)
 - Read only: `~/go/pkg/mod/gopkg.in/telebot.v3@v3.3.8/file.go`
 
-- [ ] Read telebot `file.go` to verify `FromURL()` sets `FileURL` field on the `File` struct
-- [ ] Read telebot `api.go` `sendFiles()` function to verify: when `FileURL` is set, it goes into `params` map (not `rawFiles`), and when `rawFiles` is empty, `b.Raw()` is called (JSON POST, no multipart)
-- [ ] If the code path confirms JSON POST for `FromURL`: document findings as a comment in the PR description
+- [x] Read telebot `file.go` to verify `FromURL()` sets `FileURL` field on the `File` struct
+- [x] Read telebot `api.go` `sendFiles()` function to verify: when `FileURL` is set, it goes into `params` map (not `rawFiles`), and when `rawFiles` is empty, `b.Raw()` is called (JSON POST, no multipart)
+- [x] If the code path confirms JSON POST for `FromURL`: document findings as a comment in the PR description
 - [ ] If the code path does NOT confirm JSON POST for `FromURL`, pursue fallback approaches in order:
   - (a) Check if telebot's `params` map can be set directly to pass `"file:///path"` as the video field string, bypassing `FromURL` — e.g., via `video.File = tele.File{FileURL: "file:///path"}` or manipulating `sendFiles` input
   - (b) Patch telebot locally (Go module replace directive) to handle `file://` URLs as URL parameters

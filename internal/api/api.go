@@ -259,7 +259,7 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 	finalResult = &ResultEvent{
 		Status:    "done",
 		OK:        true,
-		Title:     fmt.Sprintf("Playlist: %d videos", len(results)),
+		Title:     fmt.Sprintf("Playlist: %d/%d videos uploaded", uploadedCount, len(results)),
 		MessageID: lastMsgID,
 	}
 	writeJSON(w, flusher, finalResult)

@@ -34,6 +34,11 @@ func NewAPIService(eng *engine.Engine, bot *tele.Bot, token string) *APIService 
 	}
 }
 
+// Close stops background resources (dedup cleanup goroutine).
+func (s *APIService) Close() {
+	s.dedup.Stop()
+}
+
 // Handler returns an http.Handler with all API routes.
 func (s *APIService) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -49,10 +54,12 @@ func (s *APIService) Handler() http.Handler {
 //
 // Dedup guard: requests are deduplicated by (url, chat_id, thread_id) key.
 // If an identical request is already in progress, returns 409 Conflict.
-// If an identical request completed within the TTL (15 minutes, matching
-// the context timeout), returns the cached ResultEvent as a single NDJSON
-// line with no preceding progress events. On failure, the key is released
-// so the client can retry.
+// In-progress entries never expire — they are cleaned up when the request
+// completes or fails, preventing long uploads from being swept mid-flight.
+// If an identical request completed within the TTL (15 minutes), returns
+// the cached ResultEvent as a single NDJSON line with no preceding progress
+// events. On failure (or partial playlist failure), the key is released so
+// the client can retry.
 func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -256,13 +263,18 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 		return
 	}
 
-	finalResult = &ResultEvent{
+	result := &ResultEvent{
 		Status:    "done",
 		OK:        true,
 		Title:     fmt.Sprintf("Playlist: %d/%d videos uploaded", uploadedCount, len(results)),
 		MessageID: lastMsgID,
 	}
-	writeJSON(w, flusher, finalResult)
+	// Only cache fully successful playlists. Partial failures release the dedup key
+	// so the client can retry and deliver the missing videos.
+	if uploadedCount == len(results) {
+		finalResult = result
+	}
+	writeJSON(w, flusher, result)
 }
 
 // uploadResult uploads a ProcessResult to a Telegram chat via telebot.

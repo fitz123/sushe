@@ -17,9 +17,10 @@ type dedupEntry struct {
 }
 
 type dedupGuard struct {
-	mu      sync.Mutex
-	entries map[string]*dedupEntry
-	stopCh  chan struct{}
+	mu       sync.Mutex
+	entries  map[string]*dedupEntry
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 func newDedupGuard() *dedupGuard {
@@ -31,7 +32,17 @@ func newDedupGuard() *dedupGuard {
 	return d
 }
 
-// cleanupLoop periodically removes expired entries to prevent unbounded memory growth.
+// Stop terminates the background cleanup goroutine. Safe to call multiple times.
+func (d *dedupGuard) Stop() {
+	d.stopOnce.Do(func() {
+		close(d.stopCh)
+	})
+}
+
+// cleanupLoop periodically removes expired completed entries to prevent unbounded memory growth.
+// In-progress entries are never expired by the cleanup loop — they are removed by Complete() or
+// Release() when the request finishes. This prevents a long-running request's dedup entry from
+// being swept while the upload is still in progress.
 func (d *dedupGuard) cleanupLoop() {
 	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
@@ -41,7 +52,7 @@ func (d *dedupGuard) cleanupLoop() {
 			d.mu.Lock()
 			now := time.Now()
 			for key, entry := range d.entries {
-				if now.Sub(entry.created) > dedupTTL {
+				if entry.status == "completed" && now.Sub(entry.created) > dedupTTL {
 					delete(d.entries, key)
 				}
 			}
@@ -67,17 +78,18 @@ func (d *dedupGuard) TryAcquire(key string) (cachedResult *ResultEvent, acquired
 		return nil, true
 	}
 
-	if time.Since(existing.created) > dedupTTL {
-		// Expired — replace with fresh in-progress entry
-		d.entries[key] = &dedupEntry{status: "in_progress", created: time.Now()}
-		return nil, true
-	}
-
 	if existing.status == "completed" {
+		if time.Since(existing.created) > dedupTTL {
+			// Completed entry expired — replace with fresh in-progress entry
+			d.entries[key] = &dedupEntry{status: "in_progress", created: time.Now()}
+			return nil, true
+		}
 		return existing.result, false
 	}
 
-	// In-progress, not expired
+	// In-progress entries never expire — they are cleaned up via Complete() or Release()
+	// when the request handler finishes. This prevents long-running requests (where upload
+	// extends beyond the context timeout) from having their dedup entry swept.
 	return nil, false
 }
 

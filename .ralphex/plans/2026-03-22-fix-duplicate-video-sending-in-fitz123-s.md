@@ -111,26 +111,26 @@ cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...
 **Files:**
 - Modify: `internal/bot/bot.go`
 
-- [ ] In `uploadSingleVideo()` (around line 364): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + result.FilePath)` in the Video struct
-- [ ] In `uploadSingleVideo()`: remove the `os.Open` + ProgressReader setup code (lines 337-362) that creates the file handle, declares `lastUploadUpdate`/`lastUploadPercent`, and builds the progress reader for upload. Keep the status message edit but change it to static `"Uploading...\n{title} | {size}"` where size comes from `result.FileSize` via `formatSize()`
-- [ ] In `uploadSingleVideo()`: remove `defer file.Close()` (no file handle to close)
-- [ ] In `uploadSingleVideo()`: remove the entire Document fallback block (lines 375-396): the `if err != nil` block that opens file2, creates tele.Document, and retries
-- [ ] In `uploadSingleVideo()`: after removing fallback, the error handling becomes: if SendWithRetry fails, edit statusMsg with error and return err
-- [ ] In `uploadSplitVideo()` (around line 448): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
-- [ ] In `uploadSplitVideo()`: remove os.Open + ProgressReader setup per part, replace with static status `"Uploading Part N/M...\n{title} | {size}"` where size comes from `part.FileSize` via `formatSize()`
-- [ ] In `uploadSplitVideo()`: remove `file.Close()` call after SendWithRetry (no file handle to close)
-- [ ] In `uploadSplitVideo()`: remove Document fallback block (lines 466-488)
-- [ ] In `uploadPlaylistSingleVideo()` (around line 544): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + result.FilePath)` in the Video struct
-- [ ] In `uploadPlaylistSingleVideo()`: remove os.Open + ProgressReader setup, use static `"Uploading..."` status. File size from `result.FileSize`
-- [ ] In `uploadPlaylistSingleVideo()`: remove `defer file.Close()` (no file handle)
-- [ ] In `uploadPlaylistSingleVideo()`: remove Document fallback block (lines 559-578)
-- [ ] In `uploadPlaylistSplitVideo()` (around line 624): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
-- [ ] In `uploadPlaylistSplitVideo()`: remove os.Open + ProgressReader setup per part, use static status. File size from `part.FileSize`
-- [ ] In `uploadPlaylistSplitVideo()`: remove `file.Close()` call after SendWithRetry
-- [ ] In `uploadPlaylistSplitVideo()`: remove Document fallback block (lines 648-667)
-- [ ] Remove `ProgressReader` struct and its `Read` method (lines 19-34) — no longer used
-- [ ] Run `goimports` (or let the build/linter catch unused imports) to clean up any unused imports (`"io"`, `"os"`, `"sync"`, etc.) — do not manually audit each import
-- [ ] Verify build: `go build ./internal/bot/`
+- [x] In `uploadSingleVideo()` (around line 364): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + result.FilePath)` in the Video struct
+- [x] In `uploadSingleVideo()`: remove the `os.Open` + ProgressReader setup code (lines 337-362) that creates the file handle, declares `lastUploadUpdate`/`lastUploadPercent`, and builds the progress reader for upload. Keep the status message edit but change it to static `"Uploading...\n{title} | {size}"` where size comes from `result.FileSize` via `formatSize()`
+- [x] In `uploadSingleVideo()`: remove `defer file.Close()` (no file handle to close)
+- [x] In `uploadSingleVideo()`: remove the entire Document fallback block (lines 375-396): the `if err != nil` block that opens file2, creates tele.Document, and retries
+- [x] In `uploadSingleVideo()`: after removing fallback, the error handling becomes: if SendWithRetry fails, edit statusMsg with error and return err
+- [x] In `uploadSplitVideo()` (around line 448): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
+- [x] In `uploadSplitVideo()`: remove os.Open + ProgressReader setup per part, replace with static status `"Uploading Part N/M...\n{title} | {size}"` where size comes from `part.FileSize` via `formatSize()`
+- [x] In `uploadSplitVideo()`: remove `file.Close()` call after SendWithRetry (no file handle to close)
+- [x] In `uploadSplitVideo()`: remove Document fallback block (lines 466-488)
+- [x] In `uploadPlaylistSingleVideo()` (around line 544): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + result.FilePath)` in the Video struct
+- [x] In `uploadPlaylistSingleVideo()`: remove os.Open + ProgressReader setup, use static `"Uploading..."` status. File size from `result.FileSize`
+- [x] In `uploadPlaylistSingleVideo()`: remove `defer file.Close()` (no file handle)
+- [x] In `uploadPlaylistSingleVideo()`: remove Document fallback block (lines 559-578)
+- [x] In `uploadPlaylistSplitVideo()` (around line 624): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
+- [x] In `uploadPlaylistSplitVideo()`: remove os.Open + ProgressReader setup per part, use static status. File size from `part.FileSize`
+- [x] In `uploadPlaylistSplitVideo()`: remove `file.Close()` call after SendWithRetry
+- [x] In `uploadPlaylistSplitVideo()`: remove Document fallback block (lines 648-667)
+- [x] Remove `ProgressReader` struct and its `Read` method (lines 19-34) — no longer used
+- [x] Run `goimports` (or let the build/linter catch unused imports) to clean up any unused imports (`"io"`, `"os"`, `"sync"`, etc.) — do not manually audit each import
+- [x] Verify build: `go build ./internal/bot/`
 
 ### Task 3: Switch api.go uploads to `file://` URI and remove Document fallback [HIGH]
 

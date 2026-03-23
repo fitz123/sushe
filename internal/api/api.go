@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ type APIService struct {
 	engine *engine.Engine
 	bot    *tele.Bot
 	token  string
+	dedup  *dedupGuard
 }
 
 // NewAPIService creates a new API service.
@@ -28,7 +30,13 @@ func NewAPIService(eng *engine.Engine, bot *tele.Bot, token string) *APIService 
 		engine: eng,
 		bot:    bot,
 		token:  token,
+		dedup:  newDedupGuard(),
 	}
+}
+
+// Close stops background resources (dedup cleanup goroutine).
+func (s *APIService) Close() {
+	s.dedup.Stop()
 }
 
 // Handler returns an http.Handler with all API routes.
@@ -43,6 +51,15 @@ func (s *APIService) Handler() http.Handler {
 }
 
 // handleDownload processes POST /api/download requests.
+//
+// Dedup guard: requests are deduplicated by (url, chat_id, thread_id) key.
+// If an identical request is already in progress, returns 409 Conflict.
+// In-progress entries never expire — they are cleaned up when the request
+// completes or fails, preventing long uploads from being swept mid-flight.
+// If an identical request completed within the TTL (15 minutes), returns
+// the cached ResultEvent as a single NDJSON line with no preceding progress
+// events. On failure (or partial playlist failure), the key is released so
+// the client can retry.
 func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -82,6 +99,27 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 		logger.Warn("API request targets GENERAL topic (Bot API bug #447)", "chat_id", req.ChatID, "thread_id", req.ThreadID)
 	}
 
+	// Dedup guard: prevent duplicate processing of identical requests
+	dedupKey := req.URL + "|" + strconv.FormatInt(req.ChatID, 10) + "|" + strconv.Itoa(req.ThreadID)
+	cachedResult, acquired := s.dedup.TryAcquire(dedupKey)
+	if cachedResult != nil {
+		// Cache hit: return only the final ResultEvent, no progress events
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, `{"status":"error","ok":false,"error":"streaming not supported"}`, http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, flusher, cachedResult)
+		return
+	}
+	if !acquired {
+		http.Error(w, `{"status":"error","ok":false,"error":"duplicate request in progress"}`, http.StatusConflict)
+		return
+	}
+
 	// Set streaming headers
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -89,6 +127,7 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		s.dedup.Release(dedupKey)
 		http.Error(w, `{"status":"error","ok":false,"error":"streaming not supported"}`, http.StatusInternalServerError)
 		return
 	}
@@ -103,16 +142,28 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// Check if playlist
 	isPlaylist, playlistInfo, _ := s.engine.IsPlaylist(ctx, req.URL)
 	if isPlaylist && playlistInfo != nil {
-		s.handlePlaylistDownload(ctx, w, flusher, req, playlistInfo)
+		s.handlePlaylistDownload(ctx, w, flusher, req, playlistInfo, dedupKey)
 		return
 	}
 
 	// Single video download
-	s.handleSingleDownload(ctx, w, flusher, req)
+	s.handleSingleDownload(ctx, w, flusher, req, dedupKey)
 }
 
 // handleSingleDownload processes a single video URL.
-func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest) {
+func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, dedupKey string) {
+	var finalResult *ResultEvent
+	var handleErr error
+	defer func() {
+		if handleErr != nil {
+			s.dedup.Release(dedupKey)
+		} else if finalResult != nil {
+			s.dedup.Complete(dedupKey, finalResult)
+		} else {
+			s.dedup.Release(dedupKey) // Safety: release if neither set
+		}
+	}()
+
 	progressCb := func(phase string, percent float64, detail string) {
 		evt := ProgressEvent{
 			Status:  phase,
@@ -126,6 +177,7 @@ func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWr
 
 	result, err := s.engine.Process(ctx, req.URL, progressCb)
 	if err != nil {
+		handleErr = err
 		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: err.Error()})
 		return
 	}
@@ -134,21 +186,35 @@ func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWr
 	// Upload via telebot
 	msgID, err := s.uploadResult(result, req)
 	if err != nil {
+		handleErr = err
 		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: fmt.Sprintf("upload failed: %v", err)})
 		return
 	}
 
-	writeJSON(w, flusher, ResultEvent{
+	finalResult = &ResultEvent{
 		Status:    "done",
 		OK:        true,
 		Title:     result.Title,
 		MessageID: msgID,
 		FileSize:  result.FileSize,
-	})
+	}
+	writeJSON(w, flusher, finalResult)
 }
 
 // handlePlaylistDownload processes a playlist URL.
-func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, info interface{}) {
+func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, info interface{}, dedupKey string) {
+	var finalResult *ResultEvent
+	var handleErr error
+	defer func() {
+		if handleErr != nil {
+			s.dedup.Release(dedupKey)
+		} else if finalResult != nil {
+			s.dedup.Complete(dedupKey, finalResult)
+		} else {
+			s.dedup.Release(dedupKey) // Safety: release if neither set
+		}
+	}()
+
 	progressCb := func(videoNum, totalVideos int, phase string, percent float64) {
 		writeJSON(w, flusher, ProgressEvent{
 			Status:  phase,
@@ -160,11 +226,13 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 
 	results, err := s.engine.ProcessPlaylist(ctx, req.URL, progressCb)
 	if err != nil {
+		handleErr = err
 		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: err.Error()})
 		return
 	}
 
 	var lastMsgID int
+	var uploadedCount int
 	for i, result := range results {
 		videoNum := i + 1
 		writeJSON(w, flusher, ProgressEvent{
@@ -186,14 +254,27 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 			continue
 		}
 		lastMsgID = msgID
+		uploadedCount++
 	}
 
-	writeJSON(w, flusher, ResultEvent{
+	if uploadedCount == 0 {
+		handleErr = fmt.Errorf("all %d playlist uploads failed", len(results))
+		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: handleErr.Error()})
+		return
+	}
+
+	result := &ResultEvent{
 		Status:    "done",
 		OK:        true,
-		Title:     fmt.Sprintf("Playlist: %d videos", len(results)),
+		Title:     fmt.Sprintf("Playlist: %d/%d videos uploaded", uploadedCount, len(results)),
 		MessageID: lastMsgID,
-	})
+	}
+	// Only cache fully successful playlists. Partial failures release the dedup key
+	// (via the else branch in defer) so the client can retry for missing videos.
+	if uploadedCount == len(results) {
+		finalResult = result
+	}
+	writeJSON(w, flusher, result)
 }
 
 // uploadResult uploads a ProcessResult to a Telegram chat via telebot.
@@ -213,9 +294,11 @@ func (s *APIService) uploadResult(result *engine.ProcessResult, req DownloadRequ
 }
 
 // uploadSingleFile uploads a single video file.
+// Uses file:// URI so the local Bot API server reads directly from disk,
+// avoiding HTTP multipart upload timeouts/EOF on large files.
 func (s *APIService) uploadSingleFile(result *engine.ProcessResult, filePath, fileName, caption string, recipient tele.Recipient, opts *tele.SendOptions) (int, error) {
 	video := &tele.Video{
-		File:      tele.FromDisk(filePath),
+		File:      tele.FromURL("file://" + filePath),
 		FileName:  fileName,
 		Caption:   caption,
 		Width:     result.Width,
@@ -226,23 +309,14 @@ func (s *APIService) uploadSingleFile(result *engine.ProcessResult, filePath, fi
 
 	msg, err := upload.SendWithRetry(s.bot, recipient, video, opts)
 	if err != nil {
-		// Fallback to document
-		logger.Warn("Video send failed, trying document fallback", "error", err)
-		doc := &tele.Document{
-			File:     tele.FromDisk(filePath),
-			FileName: fileName,
-			Caption:  caption,
-		}
-		msg, err = upload.SendWithRetry(s.bot, recipient, doc, opts)
-		if err != nil {
-			return 0, err
-		}
+		return 0, err
 	}
 
 	return msg.ID, nil
 }
 
 // uploadSplitParts uploads split video parts sequentially, threading each as a reply.
+// Uses file:// URI so the local Bot API server reads directly from disk.
 func (s *APIService) uploadSplitParts(result *engine.ProcessResult, recipient tele.Recipient, baseOpts *tele.SendOptions) (int, error) {
 	var firstMsgID int
 	var prevMsg *tele.Message
@@ -252,7 +326,7 @@ func (s *APIService) uploadSplitParts(result *engine.ProcessResult, recipient te
 		partFileName := fmt.Sprintf("%s_part%d.mp4", strings.TrimSuffix(result.FileName, ".mp4"), part.PartNum)
 
 		video := &tele.Video{
-			File:      tele.FromDisk(part.FilePath),
+			File:      tele.FromURL("file://" + part.FilePath),
 			FileName:  partFileName,
 			Caption:   caption,
 			Width:     result.Width,
@@ -271,17 +345,7 @@ func (s *APIService) uploadSplitParts(result *engine.ProcessResult, recipient te
 
 		msg, err := upload.SendWithRetry(s.bot, recipient, video, opts)
 		if err != nil {
-			// Fallback to document
-			logger.Warn("Split part video send failed, trying document", "part", part.PartNum, "error", err)
-			doc := &tele.Document{
-				File:     tele.FromDisk(part.FilePath),
-				FileName: partFileName,
-				Caption:  caption,
-			}
-			msg, err = upload.SendWithRetry(s.bot, recipient, doc, opts)
-			if err != nil {
-				return firstMsgID, fmt.Errorf("failed to upload part %d: %w", part.PartNum, err)
-			}
+			return firstMsgID, fmt.Errorf("failed to upload part %d: %w", part.PartNum, err)
 		}
 
 		if part.PartNum == 1 {

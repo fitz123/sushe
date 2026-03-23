@@ -45,23 +45,23 @@ Eliminate all sources of duplicate video delivery in the sushe Telegram bot. Thr
 
 ```bash
 # Build
-cd >>/REPO_ROOT && go build ./...
+go build ./...
 
 # Run all tests
-cd >>/REPO_ROOT && go test ./... -race
+go test ./... -race
 
 # Verify no Document fallback remains
-grep -rn "tele.Document" >>/REPO_ROOT/internal/
-grep -rn "FromReader\|FromDisk" >>/REPO_ROOT/internal/bot/ >>/REPO_ROOT/internal/api/
+grep -rn "tele.Document" internal/
+grep -rn "FromReader\|FromDisk" internal/bot/ internal/api/
 
 # Verify all uploads use file:// URI
-grep -rn "FromURL" >>/REPO_ROOT/internal/bot/ >>/REPO_ROOT/internal/api/
+grep -rn "FromURL" internal/bot/ internal/api/
 
 # Verify dedup exists
-grep -rn "dedup\|Dedup" >>/REPO_ROOT/internal/api/
+grep -rn "dedup\|Dedup" internal/api/
 
 # Lint
-cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...
+golangci-lint run ./... 2>/dev/null || go vet ./...
 ```
 
 ## Decisions
@@ -96,10 +96,10 @@ cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...
 - Read only: `~/go/pkg/mod/gopkg.in/telebot.v3@v3.3.8/api.go` (telebot source in module cache)
 - Read only: `~/go/pkg/mod/gopkg.in/telebot.v3@v3.3.8/file.go`
 
-- [ ] Read telebot `file.go` to verify `FromURL()` sets `FileURL` field on the `File` struct
-- [ ] Read telebot `api.go` `sendFiles()` function to verify: when `FileURL` is set, it goes into `params` map (not `rawFiles`), and when `rawFiles` is empty, `b.Raw()` is called (JSON POST, no multipart)
-- [ ] If the code path confirms JSON POST for `FromURL`: document findings as a comment in the PR description
-- [ ] If the code path does NOT confirm JSON POST for `FromURL`, pursue fallback approaches in order:
+- [x] Read telebot `file.go` to verify `FromURL()` sets `FileURL` field on the `File` struct
+- [x] Read telebot `api.go` `sendFiles()` function to verify: when `FileURL` is set, it goes into `params` map (not `rawFiles`), and when `rawFiles` is empty, `b.Raw()` is called (JSON POST, no multipart)
+- [x] If the code path confirms JSON POST for `FromURL`: document findings as a comment in the PR description
+- [x] If the code path does NOT confirm JSON POST for `FromURL`, pursue fallback approaches in order: (N/A — verification confirmed JSON POST path)
   - (a) Check if telebot's `params` map can be set directly to pass `"file:///path"` as the video field string, bypassing `FromURL` — e.g., via `video.File = tele.File{FileURL: "file:///path"}` or manipulating `sendFiles` input
   - (b) Patch telebot locally (Go module replace directive) to handle `file://` URLs as URL parameters
   - (c) If neither works, STOP and escalate to user for re-planning — the `file://` approach is not viable without telebot cooperation
@@ -111,26 +111,26 @@ cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...
 **Files:**
 - Modify: `internal/bot/bot.go`
 
-- [ ] In `uploadSingleVideo()` (around line 364): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + result.FilePath)` in the Video struct
-- [ ] In `uploadSingleVideo()`: remove the `os.Open` + ProgressReader setup code (lines 337-362) that creates the file handle, declares `lastUploadUpdate`/`lastUploadPercent`, and builds the progress reader for upload. Keep the status message edit but change it to static `"Uploading...\n{title} | {size}"` where size comes from `result.FileSize` via `formatSize()`
-- [ ] In `uploadSingleVideo()`: remove `defer file.Close()` (no file handle to close)
-- [ ] In `uploadSingleVideo()`: remove the entire Document fallback block (lines 375-396): the `if err != nil` block that opens file2, creates tele.Document, and retries
-- [ ] In `uploadSingleVideo()`: after removing fallback, the error handling becomes: if SendWithRetry fails, edit statusMsg with error and return err
-- [ ] In `uploadSplitVideo()` (around line 448): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
-- [ ] In `uploadSplitVideo()`: remove os.Open + ProgressReader setup per part, replace with static status `"Uploading Part N/M...\n{title} | {size}"` where size comes from `part.FileSize` via `formatSize()`
-- [ ] In `uploadSplitVideo()`: remove `file.Close()` call after SendWithRetry (no file handle to close)
-- [ ] In `uploadSplitVideo()`: remove Document fallback block (lines 466-488)
-- [ ] In `uploadPlaylistSingleVideo()` (around line 544): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + result.FilePath)` in the Video struct
-- [ ] In `uploadPlaylistSingleVideo()`: remove os.Open + ProgressReader setup, use static `"Uploading..."` status. File size from `result.FileSize`
-- [ ] In `uploadPlaylistSingleVideo()`: remove `defer file.Close()` (no file handle)
-- [ ] In `uploadPlaylistSingleVideo()`: remove Document fallback block (lines 559-578)
-- [ ] In `uploadPlaylistSplitVideo()` (around line 624): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
-- [ ] In `uploadPlaylistSplitVideo()`: remove os.Open + ProgressReader setup per part, use static status. File size from `part.FileSize`
-- [ ] In `uploadPlaylistSplitVideo()`: remove `file.Close()` call after SendWithRetry
-- [ ] In `uploadPlaylistSplitVideo()`: remove Document fallback block (lines 648-667)
-- [ ] Remove `ProgressReader` struct and its `Read` method (lines 19-34) — no longer used
-- [ ] Run `goimports` (or let the build/linter catch unused imports) to clean up any unused imports (`"io"`, `"os"`, `"sync"`, etc.) — do not manually audit each import
-- [ ] Verify build: `go build ./internal/bot/`
+- [x] In `uploadSingleVideo()` (around line 364): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + result.FilePath)` in the Video struct
+- [x] In `uploadSingleVideo()`: remove the `os.Open` + ProgressReader setup code (lines 337-362) that creates the file handle, declares `lastUploadUpdate`/`lastUploadPercent`, and builds the progress reader for upload. Keep the status message edit but change it to static `"Uploading...\n{title} | {size}"` where size comes from `result.FileSize` via `formatSize()`
+- [x] In `uploadSingleVideo()`: remove `defer file.Close()` (no file handle to close)
+- [x] In `uploadSingleVideo()`: remove the entire Document fallback block (lines 375-396): the `if err != nil` block that opens file2, creates tele.Document, and retries
+- [x] In `uploadSingleVideo()`: after removing fallback, the error handling becomes: if SendWithRetry fails, edit statusMsg with error and return err
+- [x] In `uploadSplitVideo()` (around line 448): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
+- [x] In `uploadSplitVideo()`: remove os.Open + ProgressReader setup per part, replace with static status `"Uploading Part N/M...\n{title} | {size}"` where size comes from `part.FileSize` via `formatSize()`
+- [x] In `uploadSplitVideo()`: remove `file.Close()` call after SendWithRetry (no file handle to close)
+- [x] In `uploadSplitVideo()`: remove Document fallback block (lines 466-488)
+- [x] In `uploadPlaylistSingleVideo()` (around line 544): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + result.FilePath)` in the Video struct
+- [x] In `uploadPlaylistSingleVideo()`: remove os.Open + ProgressReader setup, use static `"Uploading..."` status. File size from `result.FileSize`
+- [x] In `uploadPlaylistSingleVideo()`: remove `defer file.Close()` (no file handle)
+- [x] In `uploadPlaylistSingleVideo()`: remove Document fallback block (lines 559-578)
+- [x] In `uploadPlaylistSplitVideo()` (around line 624): replace `tele.FromReader(progressReader)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
+- [x] In `uploadPlaylistSplitVideo()`: remove os.Open + ProgressReader setup per part, use static status. File size from `part.FileSize`
+- [x] In `uploadPlaylistSplitVideo()`: remove `file.Close()` call after SendWithRetry
+- [x] In `uploadPlaylistSplitVideo()`: remove Document fallback block (lines 648-667)
+- [x] Remove `ProgressReader` struct and its `Read` method (lines 19-34) — no longer used
+- [x] Run `goimports` (or let the build/linter catch unused imports) to clean up any unused imports (`"io"`, `"os"`, `"sync"`, etc.) — do not manually audit each import
+- [x] Verify build: `go build ./internal/bot/`
 
 ### Task 3: Switch api.go uploads to `file://` URI and remove Document fallback [HIGH]
 
@@ -139,14 +139,14 @@ cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...
 **Files:**
 - Modify: `internal/api/api.go`
 
-- [ ] In `uploadSingleFile()` (line 218): replace `tele.FromDisk(filePath)` with `tele.FromURL("file://" + filePath)` in the Video struct
-- [ ] In `uploadSingleFile()`: remove Document fallback block (lines 228-240): the `if err != nil` block that creates tele.Document with FromDisk and retries
-- [ ] In `uploadSingleFile()`: after removing fallback, return `0, err` directly on SendWithRetry failure
-- [ ] In `uploadSplitParts()` (line 255): replace `tele.FromDisk(part.FilePath)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
-- [ ] In `uploadSplitParts()`: remove Document fallback block (lines 272-285)
-- [ ] In `uploadSplitParts()`: after removing fallback, return error directly on failure
-- [ ] Run `goimports` to clean up any unused imports
-- [ ] Verify build: `go build ./internal/api/`
+- [x] In `uploadSingleFile()` (line 218): replace `tele.FromDisk(filePath)` with `tele.FromURL("file://" + filePath)` in the Video struct
+- [x] In `uploadSingleFile()`: remove Document fallback block (lines 228-240): the `if err != nil` block that creates tele.Document with FromDisk and retries
+- [x] In `uploadSingleFile()`: after removing fallback, return `0, err` directly on SendWithRetry failure
+- [x] In `uploadSplitParts()` (line 255): replace `tele.FromDisk(part.FilePath)` with `tele.FromURL("file://" + part.FilePath)` in the Video struct
+- [x] In `uploadSplitParts()`: remove Document fallback block (lines 272-285)
+- [x] In `uploadSplitParts()`: after removing fallback, return error directly on failure
+- [x] Run `goimports` to clean up any unused imports
+- [x] Verify build: `go build ./internal/api/`
 
 ### Task 4: Add API dedup guard for `/api/download` [HIGH]
 
@@ -163,7 +163,7 @@ Use plain string concatenation: `url + "|" + strconv.FormatInt(chatID, 10) + "|"
 
 #### Dedup data structure
 
-- [ ] Create `internal/api/dedup.go` with a `dedupGuard` struct containing:
+- [x] Create `internal/api/dedup.go` with a `dedupGuard` struct containing:
   - A `sync.Map` keyed by the concatenated string key (see format above)
   - Entry struct: `type dedupEntry struct { status string; result *ResultEvent; created time.Time }` — status is `"in_progress"` or `"completed"`
   - Constructor: `func newDedupGuard() *dedupGuard`
@@ -181,20 +181,20 @@ Use plain string concatenation: `url + "|" + strconv.FormatInt(chatID, 10) + "|"
 
 #### Wiring into handleDownload
 
-- [ ] In `api.go`, add a `dedup *dedupGuard` field to `APIService` struct
-- [ ] In `NewAPIService()`, initialize `dedup: newDedupGuard()`
-- [ ] In `handleDownload()`, after request parsing and validation (after line 83, before streaming headers at line 85): compute dedup key: `dedupKey := req.URL + "|" + strconv.FormatInt(req.ChatID, 10) + "|" + strconv.Itoa(req.ThreadID)`
-- [ ] Call `cachedResult, acquired := s.dedup.TryAcquire(dedupKey)`
-- [ ] If `cachedResult != nil` (completed, cache hit): set the same streaming headers already used by `handleDownload` (read the existing header-setting code at api.go lines 86-88 and replicate: `Content-Type: application/x-ndjson`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`), then write only the final `ResultEvent` as a single NDJSON line (no progress events — client should handle a cache-hit response having no progress stream), then return. Add a code comment: `// Cache hit: return only the final ResultEvent, no progress events`
-- [ ] If `!acquired && cachedResult == nil` (in-progress): respond with `http.Error(w, '{"status":"error","ok":false,"error":"duplicate request in progress"}', http.StatusConflict)` and return
-- [ ] If `acquired`: proceed with normal handling, passing `dedupKey` to sub-handlers
+- [x] In `api.go`, add a `dedup *dedupGuard` field to `APIService` struct
+- [x] In `NewAPIService()`, initialize `dedup: newDedupGuard()`
+- [x] In `handleDownload()`, after request parsing and validation (after line 83, before streaming headers at line 85): compute dedup key: `dedupKey := req.URL + "|" + strconv.FormatInt(req.ChatID, 10) + "|" + strconv.Itoa(req.ThreadID)`
+- [x] Call `cachedResult, acquired := s.dedup.TryAcquire(dedupKey)`
+- [x] If `cachedResult != nil` (completed, cache hit): set the same streaming headers already used by `handleDownload` (read the existing header-setting code at api.go lines 86-88 and replicate: `Content-Type: application/x-ndjson`, `Cache-Control: no-cache`, `X-Accel-Buffering: no`), then write only the final `ResultEvent` as a single NDJSON line (no progress events — client should handle a cache-hit response having no progress stream), then return. Add a code comment: `// Cache hit: return only the final ResultEvent, no progress events`
+- [x] If `!acquired && cachedResult == nil` (in-progress): respond with `http.Error(w, '{"status":"error","ok":false,"error":"duplicate request in progress"}', http.StatusConflict)` and return
+- [x] If `acquired`: proceed with normal handling, passing `dedupKey` to sub-handlers
 
 #### Wiring into sub-handlers (dedup key flow)
 
-- [ ] Change `handleSingleDownload` signature to accept an additional `dedupKey string` parameter: `func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, dedupKey string)`
-- [ ] Change `handlePlaylistDownload` signature to accept an additional `dedupKey string` parameter: `func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, info interface{}, dedupKey string)`
-- [ ] Update the call sites in `handleDownload` to pass `dedupKey`
-- [ ] In `handleSingleDownload`: use `defer` with error-check pattern for dedup lifecycle:
+- [x] Change `handleSingleDownload` signature to accept an additional `dedupKey string` parameter: `func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, dedupKey string)`
+- [x] Change `handlePlaylistDownload` signature to accept an additional `dedupKey string` parameter: `func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, info interface{}, dedupKey string)`
+- [x] Update the call sites in `handleDownload` to pass `dedupKey`
+- [x] In `handleSingleDownload`: use `defer` with error-check pattern for dedup lifecycle:
   ```go
   var finalResult *ResultEvent
   var handleErr error
@@ -207,8 +207,8 @@ Use plain string concatenation: `url + "|" + strconv.FormatInt(chatID, 10) + "|"
   }()
   ```
   Then set `finalResult` to the `&ResultEvent{...}` just before writing it at the success path (lines 141-147). Set `handleErr` on error returns.
-- [ ] In `handlePlaylistDownload`: same defer pattern. Set `finalResult` to the final `&ResultEvent{...}` at line 191-196 success path. Set `handleErr` on error at line 163.
-- [ ] Verify that all error return paths in both functions result in `Release()` being called (via the defer)
+- [x] In `handlePlaylistDownload`: same defer pattern. Set `finalResult` to the final `&ResultEvent{...}` at line 191-196 success path. Set `handleErr` on error at line 163.
+- [x] Verify that all error return paths in both functions result in `Release()` being called (via the defer)
 
 #### Cached response behavior (documented)
 
@@ -216,32 +216,32 @@ When `TryAcquire` returns a cached result, the response contains **only** the fi
 
 #### Tests
 
-- [ ] Write tests in `internal/api/dedup_test.go`:
+- [x] Write tests in `internal/api/dedup_test.go`:
   - Test: `TryAcquire` on new key returns `(nil, true)` — acquired
   - Test: `TryAcquire` on in-progress key returns `(nil, false)` — rejected
   - Test: `Complete` then `TryAcquire` returns `(cachedResult, false)` with correct data
   - Test: `Release` then `TryAcquire` returns `(nil, true)` — re-acquired after failure
   - Test: expired entries are cleaned up (set short TTL or manipulate `created` time directly on the entry)
   - Test: **concurrent access** — use a starting gate pattern for true concurrency: create a `sync.WaitGroup` and a `start` channel, launch 10 goroutines that each call `wg.Done()` then block on `<-start`, close the `start` channel to release all goroutines simultaneously, each goroutine calls `TryAcquire` with the same key. Verify exactly one returns `acquired=true` and the other 9 get `acquired=false`. This pattern with `-race` flag provides meaningful concurrency coverage.
-- [ ] Run tests: `go test ./internal/api/ -race`
+- [x] Run tests: `go test ./internal/api/ -race`
 
 ### Task 5: Verify acceptance criteria [HIGH]
 
-- [ ] Verify all 6 upload functions use `tele.FromURL("file://" + path)` — no `FromReader` or `FromDisk` remains in bot.go or api.go
-- [ ] Verify zero `tele.Document` references remain in bot.go and api.go
-- [ ] Verify `ProgressReader` struct is removed from bot.go
-- [ ] Verify dedup guard exists and is wired into `handleDownload`
-- [ ] Run full test suite: `cd >>/REPO_ROOT && go test ./... -race`
-- [ ] Run linter: `cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...`
-- [ ] Verify build: `cd >>/REPO_ROOT && go build ./cmd/sushe/`
-- [ ] Grep for leftover Document/FromReader/FromDisk in upload paths to confirm clean removal
+- [x] Verify all 6 upload functions use `tele.FromURL("file://" + path)` — no `FromReader` or `FromDisk` remains in bot.go or api.go
+- [x] Verify zero `tele.Document` references remain in bot.go and api.go
+- [x] Verify `ProgressReader` struct is removed from bot.go
+- [x] Verify dedup guard exists and is wired into `handleDownload`
+- [x] Run full test suite: `go test ./... -race`
+- [x] Run linter: `golangci-lint run ./... 2>/dev/null || go vet ./...`
+- [x] Verify build: `go build ./cmd/sushe/`
+- [x] Grep for leftover Document/FromReader/FromDisk in upload paths to confirm clean removal
 
 ### Task 6: Update documentation [HIGH]
 
-- [ ] Update README.md (if it documents the upload mechanism or Document fallback behavior) to reflect `file://` URI approach
-- [ ] Add comment in `api.go` above `handleDownload` explaining the dedup guard: purpose, TTL (15 minutes, matching context timeout), cached response format (single ResultEvent, no progress events)
-- [ ] Add comment in bot.go upload functions explaining why `FromURL` with `file://` is used (local Bot API reads from disk, avoids HTTP timeout/EOF on large files)
-- [ ] Update or create entries in GitHub issues #6 and #7 referencing the fix PR
+- [x] Update README.md (if it documents the upload mechanism or Document fallback behavior) to reflect `file://` URI approach
+- [x] Add comment in `api.go` above `handleDownload` explaining the dedup guard: purpose, TTL (15 minutes, matching context timeout), cached response format (single ResultEvent, no progress events)
+- [x] Add comment in bot.go upload functions explaining why `FromURL` with `file://` is used (local Bot API reads from disk, avoids HTTP timeout/EOF on large files)
+- [x] Update or create entries in GitHub issues #6 and #7 referencing the fix PR
 
 ## Revision Diff
 

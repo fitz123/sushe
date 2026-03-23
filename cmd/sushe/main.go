@@ -110,8 +110,9 @@ func main() {
 	}
 
 	var httpServer *http.Server
+	var apiService *api.APIService
 	if apiToken != "" {
-		apiService := api.NewAPIService(eng, botInstance, apiToken)
+		apiService = api.NewAPIService(eng, botInstance, apiToken)
 		httpServer = &http.Server{
 			Addr:              ":" + apiPort,
 			Handler:           apiService.Handler(),
@@ -134,7 +135,7 @@ func main() {
 	<-quit
 	logger.Info("Received shutdown signal, shutting down gracefully...")
 
-	// Shutdown HTTP server if running
+	// Shutdown HTTP server and API service if running
 	if httpServer != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
@@ -142,6 +143,9 @@ func main() {
 			logger.Error("HTTP server shutdown error", "error", err)
 		}
 		logger.Info("HTTP API server stopped")
+	}
+	if apiService != nil {
+		apiService.Close()
 	}
 
 	botService.Stop()

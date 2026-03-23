@@ -3,8 +3,6 @@ package bot
 import (
 	"context"
 	"fmt"
-	"io"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -15,23 +13,6 @@ import (
 	"github.com/fitz123/sushe/internal/upload"
 	tele "gopkg.in/telebot.v3"
 )
-
-// ProgressReader wraps an io.Reader to track upload progress
-type ProgressReader struct {
-	reader     io.Reader
-	total      int64
-	read       int64
-	onProgress func(read, total int64)
-}
-
-func (pr *ProgressReader) Read(p []byte) (int, error) {
-	n, err := pr.reader.Read(p)
-	pr.read += int64(n)
-	if pr.onProgress != nil {
-		pr.onProgress(pr.read, pr.total)
-	}
-	return n, err
-}
 
 type BotService struct {
 	bot          *tele.Bot
@@ -328,41 +309,16 @@ func (bs *BotService) processPlaylist(c tele.Context, playlistURL string, playli
 	return nil
 }
 
-// uploadSingleVideo uploads a non-split video result
+// uploadSingleVideo uploads a non-split video result.
+// Uses file:// URI so the local Bot API server reads directly from disk,
+// avoiding HTTP multipart upload timeouts/EOF on large files.
 func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message, result *engine.ProcessResult) error {
 	sendOpts := &tele.SendOptions{ThreadID: c.Message().ThreadID}
-	bs.bot.Edit(statusMsg, fmt.Sprintf("Uploading: 0%%\n%s | %s",
+	bs.bot.Edit(statusMsg, fmt.Sprintf("Uploading...\n%s | %s",
 		result.Title, formatSize(result.FileSize)))
 
-	file, err := os.Open(result.FilePath)
-	if err != nil {
-		bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to open downloaded file: %v", err))
-		return err
-	}
-	defer file.Close()
-
-	var lastUploadUpdate time.Time
-	var lastUploadPercent float64
-	progressReader := &ProgressReader{
-		reader: file,
-		total:  result.FileSize,
-		onProgress: func(read, total int64) {
-			now := time.Now()
-			percent := float64(read) / float64(total) * 100
-			if now.Sub(lastUploadUpdate) < 2*time.Second && percent-lastUploadPercent < 10 {
-				return
-			}
-			statusText := fmt.Sprintf("Uploading: %.0f%%\n%s | %s/%s",
-				percent, result.Title, formatSize(read), formatSize(total))
-			if _, err := bs.bot.Edit(statusMsg, statusText); err == nil {
-				lastUploadUpdate = now
-				lastUploadPercent = percent
-			}
-		},
-	}
-
 	video := &tele.Video{
-		File:      tele.FromReader(progressReader),
+		File:      tele.FromURL("file://" + result.FilePath),
 		FileName:  result.FileName,
 		Caption:   result.Title,
 		Width:     result.Width,
@@ -371,28 +327,10 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 		Streaming: true,
 	}
 
-	_, err = upload.SendWithRetry(bs.bot, c.Chat(), video, sendOpts)
+	_, err := upload.SendWithRetry(bs.bot, c.Chat(), video, sendOpts)
 	if err != nil {
-		logger.Warn("Failed to send as video, trying as document", "error", err)
-
-		file2, err2 := os.Open(result.FilePath)
-		if err2 != nil {
-			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to send video: %v", err))
-			return err
-		}
-		defer file2.Close()
-
-		doc := &tele.Document{
-			File:     tele.FromReader(file2),
-			FileName: result.FileName,
-			Caption:  result.Title,
-		}
-
-		_, err = upload.SendWithRetry(bs.bot, c.Chat(), doc, sendOpts)
-		if err != nil {
-			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to upload: %v", err))
-			return err
-		}
+		bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to upload: %v", err))
+		return err
 	}
 
 	bs.bot.Delete(statusMsg)
@@ -406,47 +344,22 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 	return nil
 }
 
-// uploadSplitVideo uploads a split video (multiple parts) with threading
+// uploadSplitVideo uploads a split video (multiple parts) with threading.
+// Uses file:// URI so the local Bot API server reads directly from disk.
 func (bs *BotService) uploadSplitVideo(c tele.Context, statusMsg *tele.Message, result *engine.ProcessResult, replyTo *tele.Message) error {
 	totalParts := len(result.Parts)
 	var prevMsg *tele.Message = replyTo
 
 	for _, part := range result.Parts {
 		partNum := part.PartNum
-		bs.bot.Edit(statusMsg, fmt.Sprintf("Uploading Part %d/%d: 0%%\n%s | %s",
+		bs.bot.Edit(statusMsg, fmt.Sprintf("Uploading Part %d/%d...\n%s | %s",
 			partNum, totalParts, result.Title, formatSize(part.FileSize)))
-
-		file, err := os.Open(part.FilePath)
-		if err != nil {
-			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to open part %d: %v", partNum, err))
-			return err
-		}
-
-		var lastUploadUpdate time.Time
-		var lastUploadPercent float64
-		progressReader := &ProgressReader{
-			reader: file,
-			total:  part.FileSize,
-			onProgress: func(read, total int64) {
-				now := time.Now()
-				percent := float64(read) / float64(total) * 100
-				if now.Sub(lastUploadUpdate) < 2*time.Second && percent-lastUploadPercent < 10 {
-					return
-				}
-				statusText := fmt.Sprintf("Uploading Part %d/%d: %.0f%%\n%s | %s/%s",
-					partNum, totalParts, percent, result.Title, formatSize(read), formatSize(total))
-				if _, err := bs.bot.Edit(statusMsg, statusText); err == nil {
-					lastUploadUpdate = now
-					lastUploadPercent = percent
-				}
-			},
-		}
 
 		caption := fmt.Sprintf("%s\n\nPart %d/%d", result.Title, partNum, totalParts)
 		partFileName := fmt.Sprintf("%s_part%d.mp4", strings.TrimSuffix(result.FileName, ".mp4"), partNum)
 
 		video := &tele.Video{
-			File:      tele.FromReader(progressReader),
+			File:      tele.FromURL("file://" + part.FilePath),
 			FileName:  partFileName,
 			Caption:   caption,
 			Width:     result.Width,
@@ -461,30 +374,9 @@ func (bs *BotService) uploadSplitVideo(c tele.Context, statusMsg *tele.Message, 
 		}
 
 		sentMsg, err := upload.SendWithRetry(bs.bot, c.Chat(), video, opts)
-		file.Close()
-
 		if err != nil {
-			logger.Warn("Failed to send part as video, trying as document", "part", partNum, "error", err)
-
-			file2, err2 := os.Open(part.FilePath)
-			if err2 != nil {
-				bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to send part %d: %v", partNum, err))
-				return err
-			}
-
-			doc := &tele.Document{
-				File:     tele.FromReader(file2),
-				FileName: partFileName,
-				Caption:  caption,
-			}
-
-			sentMsg, err = upload.SendWithRetry(bs.bot, c.Chat(), doc, opts)
-			file2.Close()
-
-			if err != nil {
-				bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to upload part %d: %v", partNum, err))
-				return err
-			}
+			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to upload part %d: %v", partNum, err))
+			return err
 		}
 
 		prevMsg = sentMsg
@@ -508,41 +400,16 @@ func (bs *BotService) uploadSplitVideo(c tele.Context, statusMsg *tele.Message, 
 	return nil
 }
 
-// uploadPlaylistSingleVideo uploads a single video from a playlist
+// uploadPlaylistSingleVideo uploads a single video from a playlist.
+// Uses file:// URI so the local Bot API server reads directly from disk.
 func (bs *BotService) uploadPlaylistSingleVideo(c tele.Context, statusMsg *tele.Message, result *engine.ProcessResult, videoNum, totalVideos int, replyTo *tele.Message) (*tele.Message, error) {
-	statusText := fmt.Sprintf("Video %d/%d: Uploading 0%%\n%s | %s",
+	statusText := fmt.Sprintf("Video %d/%d: Uploading...\n%s | %s",
 		videoNum, totalVideos, result.Title, formatSize(result.FileSize))
 	bs.bot.Edit(statusMsg, statusText)
 
-	file, err := os.Open(result.FilePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open downloaded file: %w", err)
-	}
-	defer file.Close()
-
-	var lastUploadUpdate time.Time
-	var lastUploadPercent float64
-	progressReader := &ProgressReader{
-		reader: file,
-		total:  result.FileSize,
-		onProgress: func(read, total int64) {
-			now := time.Now()
-			percent := float64(read) / float64(total) * 100
-			if now.Sub(lastUploadUpdate) < 2*time.Second && percent-lastUploadPercent < 10 {
-				return
-			}
-			statusText := fmt.Sprintf("Video %d/%d: Uploading %.0f%%\n%s | %s/%s",
-				videoNum, totalVideos, percent, result.Title, formatSize(read), formatSize(total))
-			if _, err := bs.bot.Edit(statusMsg, statusText); err == nil {
-				lastUploadUpdate = now
-				lastUploadPercent = percent
-			}
-		},
-	}
-
 	caption := fmt.Sprintf("%s\n\nVideo %d/%d", result.Title, videoNum, totalVideos)
 	video := &tele.Video{
-		File:      tele.FromReader(progressReader),
+		File:      tele.FromURL("file://" + result.FilePath),
 		FileName:  result.FileName,
 		Caption:   caption,
 		Width:     result.Width,
@@ -558,30 +425,14 @@ func (bs *BotService) uploadPlaylistSingleVideo(c tele.Context, statusMsg *tele.
 
 	sentMsg, err := upload.SendWithRetry(bs.bot, c.Chat(), video, opts)
 	if err != nil {
-		logger.Warn("Failed to send playlist video as video, trying as document", "video", videoNum, "error", err)
-
-		file2, err2 := os.Open(result.FilePath)
-		if err2 != nil {
-			return nil, fmt.Errorf("failed to send video: %w", err)
-		}
-		defer file2.Close()
-
-		doc := &tele.Document{
-			File:     tele.FromReader(file2),
-			FileName: result.FileName,
-			Caption:  caption,
-		}
-
-		sentMsg, err = upload.SendWithRetry(bs.bot, c.Chat(), doc, opts)
-		if err != nil {
-			return nil, fmt.Errorf("failed to upload: %w", err)
-		}
+		return nil, fmt.Errorf("failed to upload: %w", err)
 	}
 
 	return sentMsg, nil
 }
 
-// uploadPlaylistSplitVideo uploads a split video from a playlist (multiple parts)
+// uploadPlaylistSplitVideo uploads a split video from a playlist (multiple parts).
+// Uses file:// URI so the local Bot API server reads directly from disk.
 func (bs *BotService) uploadPlaylistSplitVideo(c tele.Context, statusMsg *tele.Message, result *engine.ProcessResult, videoNum, totalVideos int, replyTo *tele.Message) (*tele.Message, error) {
 	totalParts := len(result.Parts)
 	var lastPartMsg *tele.Message
@@ -589,40 +440,15 @@ func (bs *BotService) uploadPlaylistSplitVideo(c tele.Context, statusMsg *tele.M
 
 	for _, part := range result.Parts {
 		partNum := part.PartNum
-		statusText := fmt.Sprintf("Video %d/%d: Uploading Part %d/%d: 0%%\n%s | %s",
+		statusText := fmt.Sprintf("Video %d/%d: Uploading Part %d/%d...\n%s | %s",
 			videoNum, totalVideos, partNum, totalParts, result.Title, formatSize(part.FileSize))
 		bs.bot.Edit(statusMsg, statusText)
-
-		file, err := os.Open(part.FilePath)
-		if err != nil {
-			return lastPartMsg, fmt.Errorf("failed to open part %d: %v", partNum, err)
-		}
-
-		var lastUploadUpdate time.Time
-		var lastUploadPercent float64
-		progressReader := &ProgressReader{
-			reader: file,
-			total:  part.FileSize,
-			onProgress: func(read, total int64) {
-				now := time.Now()
-				percent := float64(read) / float64(total) * 100
-				if now.Sub(lastUploadUpdate) < 2*time.Second && percent-lastUploadPercent < 10 {
-					return
-				}
-				statusText := fmt.Sprintf("Video %d/%d: Uploading Part %d/%d: %.0f%%\n%s | %s/%s",
-					videoNum, totalVideos, partNum, totalParts, percent, result.Title, formatSize(read), formatSize(total))
-				if _, err := bs.bot.Edit(statusMsg, statusText); err == nil {
-					lastUploadUpdate = now
-					lastUploadPercent = percent
-				}
-			},
-		}
 
 		caption := fmt.Sprintf("%s\n\nVideo %d/%d - Part %d/%d", result.Title, videoNum, totalVideos, partNum, totalParts)
 		partFileName := fmt.Sprintf("%s_part%d.mp4", strings.TrimSuffix(result.FileName, ".mp4"), partNum)
 
 		video := &tele.Video{
-			File:      tele.FromReader(progressReader),
+			File:      tele.FromURL("file://" + part.FilePath),
 			FileName:  partFileName,
 			Caption:   caption,
 			Width:     result.Width,
@@ -643,28 +469,8 @@ func (bs *BotService) uploadPlaylistSplitVideo(c tele.Context, statusMsg *tele.M
 		}
 
 		sentMsg, err := upload.SendWithRetry(bs.bot, c.Chat(), video, opts)
-		file.Close()
-
 		if err != nil {
-			logger.Warn("Failed to send playlist video part as video, trying as document", "video", videoNum, "part", partNum, "error", err)
-
-			file2, err2 := os.Open(part.FilePath)
-			if err2 != nil {
-				return lastPartMsg, fmt.Errorf("failed to send part %d: %v", partNum, err)
-			}
-
-			doc := &tele.Document{
-				File:     tele.FromReader(file2),
-				FileName: partFileName,
-				Caption:  caption,
-			}
-
-			sentMsg, err = upload.SendWithRetry(bs.bot, c.Chat(), doc, opts)
-			file2.Close()
-
-			if err != nil {
-				return lastPartMsg, fmt.Errorf("failed to upload part %d: %v", partNum, err)
-			}
+			return lastPartMsg, fmt.Errorf("failed to upload part %d: %v", partNum, err)
 		}
 
 		if partNum == 1 {

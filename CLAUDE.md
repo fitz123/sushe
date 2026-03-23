@@ -25,6 +25,8 @@ sushe/
 │   └── test-split/main.go      # Test utility for video splitting
 ├── internal/
 │   ├── api/api.go              # HTTP API: POST /api/download with bearer auth
+│   ├── api/dedup.go            # Request deduplication guard for /api/download
+│   ├── api/dedup_test.go       # Tests for dedup guard
 │   ├── bot/bot.go              # Telegram handlers, progress updates, uploads
 │   ├── downloader/downloader.go # yt-dlp wrapper, ffprobe, ffmpeg, splitting
 │   ├── engine/engine.go        # Core download+transcode+split engine (no upload)
@@ -60,6 +62,7 @@ sushe/
 3. **HTTP API** (`internal/api/api.go`)
    - `POST /api/download` — download video and send to any Telegram chat/topic
    - Bearer token auth via `SUSHE_API_TOKEN` env
+   - Request deduplication by (url, chat_id, thread_id) with 15-minute TTL
    - Streams NDJSON progress events + final result
    - `GET /health` — service health check
    - Uses engine for download, telebot `Send()` for upload, `SendWithRetry` for 429 handling
@@ -130,7 +133,12 @@ bestvideo[height<=1080]+bestaudio/best
 **Errors:**
 - `401` — missing or invalid bearer token
 - `400` — missing `url` or `chat_id`
+- `409` — duplicate request already in progress (same url + chat_id + thread_id)
 - NDJSON `{"status":"error","ok":false,"error":"..."}` for download/upload failures
+
+**Deduplication:** Requests are deduplicated by (url, chat_id, thread_id). If an identical
+request completed within the last 15 minutes, the response contains only the final result
+event (no progress events). If an identical request is currently in progress, returns 409.
 
 **Health check:** `GET /health` → `OK`
 
@@ -176,7 +184,14 @@ SUSHE_API_PORT=8082               # HTTP API port (default: 8082)
 
 - `NewAPIService(engine, bot, token)` - Create API service
 - `Handler()` - Returns http.Handler with routes
-- `handleDownload(w, r)` - POST /api/download handler (auth + engine + upload + NDJSON stream)
+- `handleDownload(w, r)` - POST /api/download handler (auth + dedup + engine + upload + NDJSON stream)
+
+### dedup.go
+
+- `newDedupGuard()` - Create dedup guard with mutex-protected map and cleanup goroutine
+- `TryAcquire(key)` - Acquire dedup lock; returns cached result or in-progress status
+- `Complete(key, result)` - Mark key as completed with cached result
+- `Release(key)` - Remove key to allow retry after failure
 
 ### downloader.go
 
@@ -192,7 +207,6 @@ SUSHE_API_PORT=8082               # HTTP API port (default: 8082)
 - `processURL()` - Download via engine + upload via telebot
 - `processPlaylist()` - Playlist processing via engine
 - `updateProgress()` - Rate-limited status updates
-- `ProgressReader` - io.Reader wrapper for upload progress
 
 ### upload/retry.go
 

@@ -12,4 +12,4 @@ codex_reasoning_effort = xhigh
 
 # Notifications
 notify_channels = custom
-notify_custom_script = >>=~/.minime/workspace/.ralphex/scripts/notify-minime.sh
+notify_custom_script = ~/.minime/workspace/.ralphex/scripts/notify-minime.sh

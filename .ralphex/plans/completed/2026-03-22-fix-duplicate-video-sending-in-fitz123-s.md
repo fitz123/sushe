@@ -45,23 +45,23 @@ Eliminate all sources of duplicate video delivery in the sushe Telegram bot. Thr
 
 ```bash
 # Build
-cd >>/REPO_ROOT && go build ./...
+go build ./...
 
 # Run all tests
-cd >>/REPO_ROOT && go test ./... -race
+go test ./... -race
 
 # Verify no Document fallback remains
-grep -rn "tele.Document" >>/REPO_ROOT/internal/
-grep -rn "FromReader\|FromDisk" >>/REPO_ROOT/internal/bot/ >>/REPO_ROOT/internal/api/
+grep -rn "tele.Document" internal/
+grep -rn "FromReader\|FromDisk" internal/bot/ internal/api/
 
 # Verify all uploads use file:// URI
-grep -rn "FromURL" >>/REPO_ROOT/internal/bot/ >>/REPO_ROOT/internal/api/
+grep -rn "FromURL" internal/bot/ internal/api/
 
 # Verify dedup exists
-grep -rn "dedup\|Dedup" >>/REPO_ROOT/internal/api/
+grep -rn "dedup\|Dedup" internal/api/
 
 # Lint
-cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...
+golangci-lint run ./... 2>/dev/null || go vet ./...
 ```
 
 ## Decisions
@@ -231,9 +231,9 @@ When `TryAcquire` returns a cached result, the response contains **only** the fi
 - [x] Verify zero `tele.Document` references remain in bot.go and api.go
 - [x] Verify `ProgressReader` struct is removed from bot.go
 - [x] Verify dedup guard exists and is wired into `handleDownload`
-- [x] Run full test suite: `cd >>/REPO_ROOT && go test ./... -race`
-- [x] Run linter: `cd >>/REPO_ROOT && golangci-lint run ./... 2>/dev/null || go vet ./...`
-- [x] Verify build: `cd >>/REPO_ROOT && go build ./cmd/sushe/`
+- [x] Run full test suite: `go test ./... -race`
+- [x] Run linter: `golangci-lint run ./... 2>/dev/null || go vet ./...`
+- [x] Verify build: `go build ./cmd/sushe/`
 - [x] Grep for leftover Document/FromReader/FromDisk in upload paths to confirm clean removal
 
 ### Task 6: Update documentation [HIGH]

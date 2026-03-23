@@ -23,6 +23,9 @@ success() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
+# Service account name on remote server
+REMOTE_USER="sushe"
+
 # Load .env
 load_env() {
     if [[ -f "$REPO_DIR/.env" ]]; then
@@ -166,10 +169,10 @@ REMOTE
 transfer_binaries() {
     log "Transferring binaries to server..."
 
-    scp "$BIN_DIR/telegram-bot-api" "${REMOTE_USER}@${SERVER}:/home/$REMOTE_USER/sushe/bin/"
-    scp "$BIN_DIR/sushe" "${REMOTE_USER}@${SERVER}:/home/$REMOTE_USER/sushe/bin/"
+    scp "$BIN_DIR/telegram-bot-api" "$SSH_HOST:/home/$REMOTE_USER/sushe/bin/"
+    scp "$BIN_DIR/sushe" "$SSH_HOST:/home/$REMOTE_USER/sushe/bin/"
 
-    ssh "${REMOTE_USER}@${SERVER}" "chmod +x ~/sushe/bin/*"
+    ssh "$SSH_HOST" "chmod +x ~/sushe/bin/*"
 
     success "Binaries transferred"
 }

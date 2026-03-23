@@ -21,14 +21,14 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     -o bin/sushe cmd/sushe/main.go
 
 echo "Transferring binary..."
-scp bin/sushe "${REMOTE_USER}@${SERVER}:~/sushe/bin/sushe.new"
+scp bin/sushe "$SSH_HOST:~/sushe/bin/sushe.new"
 
 echo "Pre-flight check..."
-ssh "${REMOTE_USER}@${SERVER}" "test -x ~/sushe/bin/telegram-bot-api" \
+ssh "$SSH_HOST" "test -x ~/sushe/bin/telegram-bot-api" \
     || { echo "ERROR: telegram-bot-api binary missing on server! Run 'make deploy' to restore it."; exit 1; }
 
 echo "Swapping binary and restarting..."
-ssh "${REMOTE_USER}@${SERVER}" "cd ~/sushe && mv bin/sushe.new bin/sushe && chmod +x bin/sushe"
+ssh "$SSH_HOST" "cd ~/sushe && mv bin/sushe.new bin/sushe && chmod +x bin/sushe"
 ssh "$SSH_HOST" "sudo systemctl restart sushe"
 
 sleep 2

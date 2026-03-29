@@ -35,7 +35,8 @@ type ProgressCallback func(Progress)
 const (
 	// Local Bot API server allows up to 2GB uploads
 	MaxFileSize    = 2000 * 1024 * 1024 // 2GB in bytes
-	MaxUploadSize  = 1900 * 1024 * 1024 // 1.9GB - target size for splits
+	MaxUploadSize  = 1900 * 1024 * 1024 // 1.9GB - threshold for whether to split
+	MaxSplitSize   = 1700 * 1024 * 1024 // 1.7GB - split target with keyframe overshoot margin
 	DownloadDir    = "/tmp/sushe"
 	DefaultTimeout = 60 * time.Minute // Increased for long videos
 	
@@ -934,7 +935,7 @@ func NeedsSplit(fileSize int64) bool {
 
 // CalculateNumParts returns the number of parts needed for splitting
 func CalculateNumParts(fileSize int64) int {
-	return int(math.Ceil(float64(fileSize) / float64(MaxUploadSize)))
+	return int(math.Ceil(float64(fileSize) / float64(MaxSplitSize)))
 }
 
 // SplitVideo splits a video into parts of approximately MaxUploadSize

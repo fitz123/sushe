@@ -200,11 +200,11 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
 
 **Files:** Modify `internal/downloader/downloader.go`
 
-- [ ] Add `MaxSplitSize` constant in the const block (after line 38):
+- [x] Add `MaxSplitSize` constant in the const block (after line 38):
   ```go
   MaxSplitSize = 1700 * 1024 * 1024 // 1.7GB - split target with keyframe overshoot margin
   ```
-- [ ] Update `CalculateNumParts` to use `MaxSplitSize` instead of `MaxUploadSize`:
+- [x] Update `CalculateNumParts` to use `MaxSplitSize` instead of `MaxUploadSize`:
   ```go
   func CalculateNumParts(fileSize int64) int {
       return int(math.Ceil(float64(fileSize) / float64(MaxSplitSize)))

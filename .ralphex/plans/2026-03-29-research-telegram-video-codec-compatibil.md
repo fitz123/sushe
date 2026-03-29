@@ -138,7 +138,7 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
 
 **Files:** Modify `internal/downloader/downloader.go`
 
-- [ ] Add `GetAudioCodec(filePath string) (string, error)` function after `GetVideoCodec` (after line 792):
+- [x] Add `GetAudioCodec(filePath string) (string, error)` function after `GetVideoCodec` (after line 792):
   ```go
   // GetAudioCodec returns the audio codec name (e.g., "aac", "opus", "vorbis")
   func GetAudioCodec(filePath string) (string, error) {
@@ -157,7 +157,7 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
       return strings.TrimSpace(string(output)), nil
   }
   ```
-- [ ] Add `GetPixelFormat(filePath string) (string, error)` function:
+- [x] Add `GetPixelFormat(filePath string) (string, error)` function:
   ```go
   // GetPixelFormat returns the pixel format (e.g., "yuv420p", "yuv420p10le")
   func GetPixelFormat(filePath string) (string, error) {
@@ -176,7 +176,7 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
       return strings.TrimSpace(string(output)), nil
   }
   ```
-- [ ] Add `Is10Bit(pixFmt string) bool` helper:
+- [x] Add `Is10Bit(pixFmt string) bool` helper:
   ```go
   // Is10Bit returns true if the pixel format indicates 10-bit or higher color depth
   func Is10Bit(pixFmt string) bool {
@@ -186,7 +186,7 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
           strings.Contains(pixFmt, "16le") || strings.Contains(pixFmt, "16be")
   }
   ```
-- [ ] Add `IsAACCompatible(audioCodec string) bool` helper:
+- [x] Add `IsAACCompatible(audioCodec string) bool` helper:
   ```go
   // IsAACCompatible returns true if the audio codec is AAC (safe for copy in Telegram)
   func IsAACCompatible(audioCodec string) bool {

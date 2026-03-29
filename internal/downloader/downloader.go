@@ -797,6 +797,53 @@ func IsH264Compatible(codec string) bool {
 	return codec == "h264" || codec == "avc" || codec == "avc1"
 }
 
+// GetAudioCodec returns the audio codec name (e.g., "aac", "opus", "vorbis")
+func GetAudioCodec(filePath string) (string, error) {
+	args := []string{
+		"-v", "quiet",
+		"-select_streams", "a:0",
+		"-show_entries", "stream=codec_name",
+		"-of", "csv=p=0",
+		filePath,
+	}
+	cmd := exec.Command("ffprobe", args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("ffprobe audio codec failed: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// GetPixelFormat returns the pixel format (e.g., "yuv420p", "yuv420p10le")
+func GetPixelFormat(filePath string) (string, error) {
+	args := []string{
+		"-v", "quiet",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=pix_fmt",
+		"-of", "csv=p=0",
+		filePath,
+	}
+	cmd := exec.Command("ffprobe", args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("ffprobe pixel format failed: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// Is10Bit returns true if the pixel format indicates 10-bit or higher color depth
+func Is10Bit(pixFmt string) bool {
+	pixFmt = strings.ToLower(pixFmt)
+	return strings.Contains(pixFmt, "10le") || strings.Contains(pixFmt, "10be") ||
+		strings.Contains(pixFmt, "12le") || strings.Contains(pixFmt, "12be") ||
+		strings.Contains(pixFmt, "16le") || strings.Contains(pixFmt, "16be")
+}
+
+// IsAACCompatible returns true if the audio codec is AAC (safe for copy in Telegram)
+func IsAACCompatible(audioCodec string) bool {
+	return strings.ToLower(audioCodec) == "aac"
+}
+
 // ReencodeToH264 converts a video to H.264/AAC format for Telegram compatibility
 // Returns the path to the new file (original file is kept)
 func (d *Downloader) ReencodeToH264(ctx context.Context, filePath string, progressCb ProgressCallback) (string, error) {

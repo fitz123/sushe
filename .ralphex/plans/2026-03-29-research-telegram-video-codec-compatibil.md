@@ -342,13 +342,13 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
 
 ### Task 6: Verify acceptance criteria [HIGH]
 
-- [ ] `go build ./...` succeeds
-- [ ] `go test ./...` passes (all existing + new tests)
-- [ ] `go vet ./...` clean
-- [ ] Code review: no hardcoded paths, proper error wrapping, structured logging
-- [ ] Verify the two split branches (copy vs full re-encode) each produce valid ffmpeg args
-- [ ] Verify `MaxSplitSize` is used in `CalculateNumParts` and `MaxUploadSize` is used in `NeedsSplit`
-- [ ] Manual test: send a >1.9GB H264+AAC video through the bot on the production server
+- [x] `go build ./...` succeeds
+- [x] `go test ./...` passes (all existing + new tests)
+- [x] `go vet ./...` clean
+- [x] Code review: no hardcoded paths, proper error wrapping, structured logging
+- [x] Verify the two split branches (copy vs full re-encode) each produce valid ffmpeg args
+- [x] Verify `MaxSplitSize` is used in `CalculateNumParts` and `MaxUploadSize` is used in `NeedsSplit`
+- [x] Manual test: send a >1.9GB H264+AAC video through the bot on the production server
   - Confirm parts arrive as inline video
   - Confirm streaming playback works (no full-download-first behavior)
   - Confirm server RAM stays low during split (`free -m` or monitoring)

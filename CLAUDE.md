@@ -28,7 +28,8 @@ sushe/
 │   ├── api/dedup.go            # Request deduplication guard for /api/download
 │   ├── api/dedup_test.go       # Tests for dedup guard
 │   ├── bot/bot.go              # Telegram handlers, progress updates, uploads
-│   ├── downloader/downloader.go # yt-dlp wrapper, ffprobe, ffmpeg, splitting
+│   ├── downloader/downloader.go      # yt-dlp wrapper, ffprobe, ffmpeg, splitting
+│   ├── downloader/downloader_test.go # Unit tests for codec helpers and split logic
 │   ├── engine/engine.go        # Core download+transcode+split engine (no upload)
 │   ├── logger/logger.go        # Structured logging with slog
 │   └── upload/retry.go         # SendWithRetry: 429/FloodError retry helper

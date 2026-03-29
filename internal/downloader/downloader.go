@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -837,12 +838,19 @@ func Is10Bit(pixFmt string) bool {
 	pixFmt = strings.ToLower(pixFmt)
 	return strings.Contains(pixFmt, "10le") || strings.Contains(pixFmt, "10be") ||
 		strings.Contains(pixFmt, "12le") || strings.Contains(pixFmt, "12be") ||
+		strings.Contains(pixFmt, "14le") || strings.Contains(pixFmt, "14be") ||
 		strings.Contains(pixFmt, "16le") || strings.Contains(pixFmt, "16be")
 }
 
 // IsAACCompatible returns true if the audio codec is AAC (safe for copy in Telegram)
 func IsAACCompatible(audioCodec string) bool {
 	return strings.ToLower(audioCodec) == "aac"
+}
+
+// CanStreamCopy returns true if the source codecs are compatible with -c copy splitting.
+// Requires H264 video + AAC audio + 8-bit pixel format.
+func CanStreamCopy(videoCodec, audioCodec, pixFmt string) bool {
+	return IsH264Compatible(videoCodec) && IsAACCompatible(audioCodec) && !Is10Bit(pixFmt)
 }
 
 // ReencodeToH264 converts a video to H.264/AAC format for Telegram compatibility
@@ -971,7 +979,7 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 		pixFmt = "unknown"
 	}
 
-	canStreamCopy := IsH264Compatible(videoCodec) && IsAACCompatible(audioCodec) && !Is10Bit(pixFmt)
+	canStreamCopy := CanStreamCopy(videoCodec, audioCodec, pixFmt)
 
 	// Calculate number of parts and segment duration
 	numParts := CalculateNumParts(mediaInfo.FileSize)
@@ -1019,9 +1027,9 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 			"-vf", "scale=-2:720",
 			"-pix_fmt", "yuv420p",
 			"-c:a", "aac",
-			"-movflags", "+faststart",
 			"-f", "segment",
 			"-segment_time", fmt.Sprintf("%.2f", segmentDuration),
+			"-segment_format_options", "movflags=+faststart",
 			"-reset_timestamps", "1",
 			"-y",
 			outputPattern,
@@ -1097,10 +1105,12 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 	}
 
 	// Sort and create PartInfo list
+	sort.Strings(partFiles)
 	var parts []PartInfo
 	for i, partFile := range partFiles {
 		info, err := os.Stat(partFile)
 		if err != nil {
+			logger.Warn("Failed to stat split part", "file", partFile, "error", err)
 			continue
 		}
 		parts = append(parts, PartInfo{

@@ -1,7 +1,6 @@
 package downloader
 
 import (
-	"math"
 	"testing"
 )
 
@@ -61,6 +60,8 @@ func TestIs10Bit(t *testing.T) {
 		{"yuv420p12be", true},
 		{"yuv420p16le", true},
 		{"yuv420p16be", true},
+		{"yuv420p14le", true},
+		{"yuv420p14be", true},
 		{"yuv420p", false},
 		{"yuv422p", false},
 		{"yuv444p", false},
@@ -83,7 +84,7 @@ func TestCalculateNumParts(t *testing.T) {
 	}{
 		{"exactly 1.7GB", MaxSplitSize, 1},
 		{"exactly 3.4GB", 2 * MaxSplitSize, 2},
-		{"3.5GB needs 3 parts", 3500 * 1024 * 1024, int(math.Ceil(float64(3500*1024*1024) / float64(MaxSplitSize)))},
+		{"3.5GB needs 3 parts", 3500 * 1024 * 1024, 3},
 		{"1.8GB needs 2 parts", 1800 * 1024 * 1024, 2},
 		{"small file", 100 * 1024 * 1024, 1},
 	}
@@ -137,7 +138,7 @@ func TestCanStreamCopyDecision(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := IsH264Compatible(tt.videoCodec) && IsAACCompatible(tt.audioCodec) && !Is10Bit(tt.pixFmt)
+			got := CanStreamCopy(tt.videoCodec, tt.audioCodec, tt.pixFmt)
 			if got != tt.want {
 				t.Errorf("canStreamCopy(%q, %q, %q) = %v, want %v",
 					tt.videoCodec, tt.audioCodec, tt.pixFmt, got, tt.want)

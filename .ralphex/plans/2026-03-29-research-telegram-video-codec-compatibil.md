@@ -295,7 +295,7 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
 
 **Files:** Modify `internal/downloader/downloader.go` (inside `SplitVideo`, after part collection)
 
-- [ ] After collecting parts (around line 1017), add size validation for the copy branch only:
+- [x] After collecting parts (around line 1017), add size validation for the copy branch only:
   ```go
   // Warn if any -c copy part exceeds MaxUploadSize (keyframe overshoot)
   if canStreamCopy {

@@ -1115,5 +1115,17 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 	}
 
 	logger.Info("Split complete", "numParts", len(parts))
+
+	// Warn if any -c copy part exceeds MaxUploadSize (keyframe overshoot)
+	if canStreamCopy {
+		for _, p := range parts {
+			if p.FileSize > MaxUploadSize {
+				logger.Warn("Split part exceeds MaxUploadSize after -c copy split",
+					"part", p.PartNum, "size", p.FileSize,
+					"maxUploadSize", int64(MaxUploadSize), "file", p.FilePath)
+			}
+		}
+	}
+
 	return parts, nil
 }

@@ -959,6 +959,9 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 	if mediaInfo.Duration <= 0 {
 		return nil, fmt.Errorf("invalid video duration: %f", mediaInfo.Duration)
 	}
+	if mediaInfo.FileSize <= 0 {
+		return nil, fmt.Errorf("invalid file size from ffprobe: %d", mediaInfo.FileSize)
+	}
 
 	// Detect codecs to determine split strategy
 	videoCodec, err := GetVideoCodec(filePath)

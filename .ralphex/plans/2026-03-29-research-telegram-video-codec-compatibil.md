@@ -316,24 +316,24 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
 
 **Files:** Create `internal/downloader/downloader_test.go` (or add to existing test file)
 
-- [ ] Test `IsH264Compatible()` (existing function, tests cover current behavior):
+- [x] Test `IsH264Compatible()` (existing function, tests cover current behavior):
   - Positive: `"h264"`, `"H264"`, `"avc"`, `"avc1"`
   - Negative: `"vp9"`, `"av1"`, `"hevc"`, `""`
-- [ ] Test `IsAACCompatible()` (new function):
+- [x] Test `IsAACCompatible()` (new function):
   - Positive: `"aac"`, `"AAC"`
   - Negative: `"opus"`, `"vorbis"`, `"mp3"`, `""`
-- [ ] Test `Is10Bit()` (new function):
+- [x] Test `Is10Bit()` (new function):
   - Positive: `"yuv420p10le"`, `"yuv422p10le"`, `"yuv420p10be"`, `"yuv444p12le"`
   - Negative: `"yuv420p"`, `"yuv422p"`, `"yuv444p"`, `""`
-- [ ] Test `CalculateNumParts()` with `MaxSplitSize`:
+- [x] Test `CalculateNumParts()` with `MaxSplitSize`:
   - Input 1.7GB -> 1 part
   - Input 3.4GB -> 2 parts
   - Input 3.5GB -> 3 parts (ceil)
   - Input 1.8GB -> 2 parts (just over 1.7GB)
-- [ ] Test `NeedsSplit()` still uses `MaxUploadSize` (1.9GB threshold):
+- [x] Test `NeedsSplit()` still uses `MaxUploadSize` (1.9GB threshold):
   - Input 1.9GB -> false
   - Input 1.9GB + 1 -> true
-- [ ] Test `canStreamCopy` decision logic (combined condition):
+- [x] Test `canStreamCopy` decision logic (combined condition):
   - H264 + AAC + yuv420p -> true (Branch A)
   - VP9 + AAC + yuv420p -> false (Branch B)
   - H264 + Opus + yuv420p -> false (Branch B)

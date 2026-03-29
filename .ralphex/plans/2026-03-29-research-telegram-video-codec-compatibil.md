@@ -356,9 +356,9 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
 
 ### Task 7: Update documentation [LOW]
 
-- [ ] Update the `SplitVideo` function comment (already in Task 3)
-- [ ] If the project has a CLAUDE.md or architecture doc, note the codec-aware split optimization
-- [ ] Update any relevant issue/task with the commit hash and results
+- [x] Update the `SplitVideo` function comment (already in Task 3)
+- [x] If the project has a CLAUDE.md or architecture doc, note the codec-aware split optimization
+- [x] Update any relevant issue/task with the commit hash and results
 
 ---
 

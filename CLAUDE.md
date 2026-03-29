@@ -76,9 +76,12 @@ sushe/
 
 5. **Downloader** (`internal/downloader/downloader.go`)
    - yt-dlp wrapper with format selection preferring H.264
-   - Codec detection via ffprobe
+   - Codec detection via ffprobe (video codec, audio codec, pixel format)
    - Conditional re-encoding (VP9/AV1 → H.264) via ffmpeg
-   - Video splitting for files >1.9GB
+   - Codec-aware video splitting for files >1.9GB:
+     - Branch A: `-c copy` (stream copy) for H264+AAC+8-bit — zero RAM overhead
+     - Branch B: Full re-encode with memory-safe settings (`ultrafast`, 720p, 1 thread) for incompatible codecs
+   - Split target size: 1.7GB (`MaxSplitSize`) with 200MB margin for keyframe overshoot
 
 6. **Upload Retry** (`internal/upload/retry.go`)
    - `SendWithRetry()` wraps telebot `Send()` with 429/FloodError handling
@@ -89,7 +92,8 @@ sushe/
 
 ```
 URL → Engine.Process() → yt-dlp download → codec check (ffprobe)
-    → re-encode if needed (ffmpeg) → split if >1.9GB → ProcessResult
+    → re-encode if needed (ffmpeg) → split if >1.9GB (codec-aware) → ProcessResult
+    ↓ Split: H264+AAC+8bit → -c copy | else → re-encode (ultrafast/720p/1 thread)
     ↓ Bot mode: telebot sendInThread (with progress message editing)
     ↓ HTTP API: telebot Send + NDJSON progress stream to caller
 ```
@@ -196,11 +200,16 @@ SUSHE_API_PORT=8082               # HTTP API port (default: 8082)
 ### downloader.go
 
 - `Download(url, outputDir, progressCb)` - Download video with yt-dlp
-- `GetVideoCodec(path)` - Get codec via ffprobe
-- `IsH264Compatible(codec)` - Check if codec needs re-encoding
+- `GetVideoCodec(path)` - Get video codec via ffprobe
+- `GetAudioCodec(path)` - Get audio codec via ffprobe
+- `GetPixelFormat(path)` - Get pixel format via ffprobe
+- `IsH264Compatible(codec)` - Check if video codec is H.264
+- `IsAACCompatible(codec)` - Check if audio codec is AAC
+- `Is10Bit(pixFmt)` - Check if pixel format is 10-bit or higher
 - `ReencodeToH264(input, output, progressCb)` - Convert to H.264
-- `NeedsSplit(path)` - Check if file >1.9GB
-- `SplitVideo(path, outputDir, progressCb)` - Split into parts
+- `NeedsSplit(path)` - Check if file >1.9GB (`MaxUploadSize`)
+- `CalculateNumParts(fileSize)` - Calculate split parts using 1.7GB target (`MaxSplitSize`)
+- `SplitVideo(path, outputDir, progressCb)` - Codec-aware split (stream copy or re-encode)
 
 ### bot.go
 
@@ -243,9 +252,13 @@ Edit format string in `downloader.go`:
 
 ### Change split threshold
 
-Edit `MaxTelegramFileSize` constant in `downloader.go`:
+Two constants control splitting in `downloader.go`:
+- `MaxUploadSize` (1.9GB) — threshold for whether to split at all
+- `MaxSplitSize` (1.7GB) — target part size (with 200MB keyframe overshoot margin for `-c copy`)
+
 ```go
-const MaxTelegramFileSize = 1.9 * 1024 * 1024 * 1024  // 1.9GB
+MaxUploadSize = 1900 * 1024 * 1024  // 1.9GB - split trigger threshold
+MaxSplitSize  = 1700 * 1024 * 1024  // 1.7GB - split target size per part
 ```
 
 ### Debug locally

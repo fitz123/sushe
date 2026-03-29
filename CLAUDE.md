@@ -80,7 +80,7 @@ sushe/
    - Codec detection via ffprobe (video codec, audio codec, pixel format)
    - Conditional re-encoding (VP9/AV1 → H.264) via ffmpeg
    - Codec-aware video splitting for files >1.9GB:
-     - Branch A: `-c copy` (stream copy) for H264+AAC+8-bit — zero RAM overhead
+     - Branch A: `-c copy` (stream copy) for H264+AAC+yuv420p — zero RAM overhead
      - Branch B: Full re-encode with memory-safe settings (`ultrafast`, 720p, 1 thread) for incompatible codecs
    - Split target size: 1.7GB (`MaxSplitSize`) with 200MB margin for keyframe overshoot
 
@@ -94,7 +94,7 @@ sushe/
 ```
 URL → Engine.Process() → yt-dlp download → codec check (ffprobe)
     → re-encode if needed (ffmpeg) → split if >1.9GB (codec-aware) → ProcessResult
-    ↓ Split: H264+AAC+8bit → -c copy | else → re-encode (ultrafast/720p/1 thread)
+    ↓ Split: H264+AAC+yuv420p → -c copy | else → re-encode (ultrafast/720p/1 thread)
     ↓ Bot mode: telebot sendInThread (with progress message editing)
     ↓ HTTP API: telebot Send + NDJSON progress stream to caller
 ```
@@ -206,7 +206,8 @@ SUSHE_API_PORT=8082               # HTTP API port (default: 8082)
 - `GetPixelFormat(path)` - Get pixel format via ffprobe
 - `IsH264Compatible(codec)` - Check if video codec is H.264
 - `IsAACCompatible(codec)` - Check if audio codec is AAC
-- `Is10Bit(pixFmt)` - Check if pixel format is 10-bit or higher
+- `Is420p(pixFmt)` - Check if pixel format is 4:2:0 8-bit
+- `CanStreamCopy(videoCodec, audioCodec, pixFmt)` - Check if codecs allow -c copy splitting
 - `ReencodeToH264(input, output, progressCb)` - Convert to H.264
 - `NeedsSplit(path)` - Check if file >1.9GB (`MaxUploadSize`)
 - `CalculateNumParts(fileSize)` - Calculate split parts using 1.7GB target (`MaxSplitSize`)

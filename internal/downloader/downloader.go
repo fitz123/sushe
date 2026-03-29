@@ -833,15 +833,6 @@ func GetPixelFormat(filePath string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-// Is10Bit returns true if the pixel format indicates 10-bit or higher color depth
-func Is10Bit(pixFmt string) bool {
-	pixFmt = strings.ToLower(pixFmt)
-	return strings.Contains(pixFmt, "10le") || strings.Contains(pixFmt, "10be") ||
-		strings.Contains(pixFmt, "12le") || strings.Contains(pixFmt, "12be") ||
-		strings.Contains(pixFmt, "14le") || strings.Contains(pixFmt, "14be") ||
-		strings.Contains(pixFmt, "16le") || strings.Contains(pixFmt, "16be")
-}
-
 // IsAACCompatible returns true if the audio codec is AAC (safe for copy in Telegram)
 func IsAACCompatible(audioCodec string) bool {
 	return strings.ToLower(audioCodec) == "aac"
@@ -883,6 +874,7 @@ func (d *Downloader) ReencodeToH264(ctx context.Context, filePath string, progre
 		"-c:v", "libx264",
 		"-preset", "fast",
 		"-crf", "23",
+		"-pix_fmt", "yuv420p",
 		"-c:a", "aac",
 		"-movflags", "+faststart",
 		"-y", // Overwrite output

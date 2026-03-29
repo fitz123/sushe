@@ -48,34 +48,6 @@ func TestIsAACCompatible(t *testing.T) {
 	}
 }
 
-func TestIs10Bit(t *testing.T) {
-	tests := []struct {
-		pixFmt string
-		want   bool
-	}{
-		{"yuv420p10le", true},
-		{"yuv422p10le", true},
-		{"yuv420p10be", true},
-		{"yuv444p12le", true},
-		{"yuv420p12be", true},
-		{"yuv420p16le", true},
-		{"yuv420p16be", true},
-		{"yuv420p14le", true},
-		{"yuv420p14be", true},
-		{"yuv420p", false},
-		{"yuv422p", false},
-		{"yuv444p", false},
-		{"", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.pixFmt, func(t *testing.T) {
-			if got := Is10Bit(tt.pixFmt); got != tt.want {
-				t.Errorf("Is10Bit(%q) = %v, want %v", tt.pixFmt, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestIs420p(t *testing.T) {
 	tests := []struct {
 		pixFmt string

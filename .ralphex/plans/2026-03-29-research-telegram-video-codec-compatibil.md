@@ -218,7 +218,7 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
 
 **Files:** Modify `internal/downloader/downloader.go` (function `SplitVideo`, lines 893-1025)
 
-- [ ] Add codec/audio/pixfmt detection at the start of `SplitVideo()`, after `GetMediaInfo`:
+- [x] Add codec/audio/pixfmt detection at the start of `SplitVideo()`, after `GetMediaInfo`:
   ```go
   // Detect codecs to determine split strategy
   videoCodec, err := GetVideoCodec(filePath)
@@ -241,7 +241,7 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
 
   canStreamCopy := IsH264Compatible(videoCodec) && IsAACCompatible(audioCodec) && !Is10Bit(pixFmt)
   ```
-- [ ] Build ffmpeg args conditionally with exactly two branches:
+- [x] Build ffmpeg args conditionally with exactly two branches:
   ```go
   var args []string
   if canStreamCopy {
@@ -280,14 +280,14 @@ Risk if wrong: A part exceeds 1.9GB and Telegram rejects the upload. Mitigation:
       }
   }
   ```
-- [ ] Update the comment on the `SplitVideo` function to reflect the new behavior:
+- [x] Update the comment on the `SplitVideo` function to reflect the new behavior:
   ```go
   // SplitVideo splits a video into parts of approximately MaxSplitSize.
   // Uses stream copy (-c copy) for H264+AAC+8-bit sources (zero RAM overhead).
   // Falls back to full re-encode with memory-safe settings for incompatible codecs.
   ```
-- [ ] Keep the progress callback goroutine and part collection logic (lines 937-1025) unchanged -- they work for both copy and re-encode modes
-- [ ] Replace the old `-movflags +faststart` (which applies to the whole output, not individual segments) with `-segment_format_options movflags=+faststart` in Branch A (per-segment faststart). Branch B uses `-movflags +faststart` which ffmpeg applies to each segment when used with `-f segment`.
+- [x] Keep the progress callback goroutine and part collection logic (lines 937-1025) unchanged -- they work for both copy and re-encode modes
+- [x] Replace the old `-movflags +faststart` (which applies to the whole output, not individual segments) with `-segment_format_options movflags=+faststart` in Branch A (per-segment faststart). Branch B uses `-movflags +faststart` which ffmpeg applies to each segment when used with `-f segment`.
 
 ### Task 4: Add post-split size validation (warn-only) [MED]
 

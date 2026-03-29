@@ -938,8 +938,9 @@ func CalculateNumParts(fileSize int64) int {
 	return int(math.Ceil(float64(fileSize) / float64(MaxSplitSize)))
 }
 
-// SplitVideo splits a video into parts of approximately MaxUploadSize
-// It re-encodes for precise cuts at segment boundaries
+// SplitVideo splits a video into parts of approximately MaxSplitSize.
+// Uses stream copy (-c copy) for H264+AAC+8-bit sources (zero RAM overhead).
+// Falls back to full re-encode with memory-safe settings for incompatible codecs.
 func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb ProgressCallback) ([]PartInfo, error) {
 	// Get media info
 	mediaInfo, err := GetMediaInfo(filePath)
@@ -951,6 +952,27 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 		return nil, fmt.Errorf("invalid video duration: %f", mediaInfo.Duration)
 	}
 
+	// Detect codecs to determine split strategy
+	videoCodec, err := GetVideoCodec(filePath)
+	if err != nil {
+		logger.Warn("Failed to detect video codec, will re-encode", "error", err)
+		videoCodec = "unknown"
+	}
+
+	audioCodec, err := GetAudioCodec(filePath)
+	if err != nil {
+		logger.Warn("Failed to detect audio codec, will re-encode audio", "error", err)
+		audioCodec = "unknown"
+	}
+
+	pixFmt, err := GetPixelFormat(filePath)
+	if err != nil {
+		logger.Warn("Failed to detect pixel format, will re-encode", "error", err)
+		pixFmt = "unknown"
+	}
+
+	canStreamCopy := IsH264Compatible(videoCodec) && IsAACCompatible(audioCodec) && !Is10Bit(pixFmt)
+
 	// Calculate number of parts and segment duration
 	numParts := CalculateNumParts(mediaInfo.FileSize)
 	segmentDuration := mediaInfo.Duration / float64(numParts)
@@ -960,6 +982,7 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 		"duration", mediaInfo.Duration,
 		"numParts", numParts,
 		"segmentDuration", segmentDuration,
+		"canStreamCopy", canStreamCopy,
 	)
 
 	// Create output pattern
@@ -967,19 +990,42 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 	baseName := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
 	outputPattern := filepath.Join(dir, baseName+"_part%03d.mp4")
 
-	// Build ffmpeg command for segmented output with re-encoding for precise cuts
-	args := []string{
-		"-i", filePath,
-		"-c:v", "libx264",
-		"-preset", "fast",
-		"-crf", "23",
-		"-c:a", "aac",
-		"-movflags", "+faststart",
-		"-f", "segment",
-		"-segment_time", fmt.Sprintf("%.2f", segmentDuration),
-		"-reset_timestamps", "1",
-		"-y", // Overwrite output files
-		outputPattern,
+	// Build ffmpeg args conditionally
+	var args []string
+	if canStreamCopy {
+		// Branch A: Stream copy — zero RAM, instant split
+		logger.Info("Splitting with stream copy (H264+AAC+8bit)",
+			"videoCodec", videoCodec, "audioCodec", audioCodec, "pixFmt", pixFmt)
+		args = []string{
+			"-i", filePath,
+			"-c", "copy",
+			"-f", "segment",
+			"-segment_time", fmt.Sprintf("%.2f", segmentDuration),
+			"-segment_format_options", "movflags=+faststart",
+			"-reset_timestamps", "1",
+			"-y",
+			outputPattern,
+		}
+	} else {
+		// Branch B: Full re-encode with memory-safe settings
+		logger.Info("Splitting with full re-encode (incompatible source)",
+			"videoCodec", videoCodec, "audioCodec", audioCodec, "pixFmt", pixFmt)
+		args = []string{
+			"-i", filePath,
+			"-c:v", "libx264",
+			"-preset", "ultrafast",
+			"-crf", "23",
+			"-threads", "1",
+			"-vf", "scale=-2:720",
+			"-pix_fmt", "yuv420p",
+			"-c:a", "aac",
+			"-movflags", "+faststart",
+			"-f", "segment",
+			"-segment_time", fmt.Sprintf("%.2f", segmentDuration),
+			"-reset_timestamps", "1",
+			"-y",
+			outputPattern,
+		}
 	}
 
 	logger.Debug("Running ffmpeg split", "args", args)

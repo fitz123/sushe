@@ -76,6 +76,29 @@ func TestIs10Bit(t *testing.T) {
 	}
 }
 
+func TestIs420p(t *testing.T) {
+	tests := []struct {
+		pixFmt string
+		want   bool
+	}{
+		{"yuv420p", true},
+		{"yuvj420p", true},
+		{"YUV420P", true},
+		{"yuv422p", false},
+		{"yuv444p", false},
+		{"yuv420p10le", false},
+		{"nv12", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.pixFmt, func(t *testing.T) {
+			if got := Is420p(tt.pixFmt); got != tt.want {
+				t.Errorf("Is420p(%q) = %v, want %v", tt.pixFmt, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCalculateNumParts(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -130,7 +153,9 @@ func TestCanStreamCopyDecision(t *testing.T) {
 		{"H264 + Opus + yuv420p", "h264", "opus", "yuv420p", false},
 		{"H264 + AAC + yuv420p10le", "h264", "aac", "yuv420p10le", false},
 		{"unknown + unknown + unknown", "unknown", "unknown", "unknown", false},
-		{"H264 + AAC + yuv422p", "h264", "aac", "yuv422p", true},
+		{"H264 + AAC + yuv422p", "h264", "aac", "yuv422p", false},
+		{"H264 + AAC + yuv444p", "h264", "aac", "yuv444p", false},
+		{"H264 + AAC + yuvj420p", "h264", "aac", "yuvj420p", true},
 		{"AVC1 + AAC + yuv420p", "avc1", "aac", "yuv420p", true},
 		{"H264 + MP3 + yuv420p", "h264", "mp3", "yuv420p", false},
 		{"HEVC + AAC + yuv420p", "hevc", "aac", "yuv420p", false},

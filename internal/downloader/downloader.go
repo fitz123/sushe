@@ -847,10 +847,18 @@ func IsAACCompatible(audioCodec string) bool {
 	return strings.ToLower(audioCodec) == "aac"
 }
 
+// Is420p returns true if the pixel format is 4:2:0 8-bit (compatible with Telegram inline playback).
+// Only yuv420p and yuvj420p (jpeg-range variant) are accepted; other subsampling formats
+// like yuv422p or yuv444p are not widely supported by mobile hardware decoders.
+func Is420p(pixFmt string) bool {
+	pixFmt = strings.ToLower(pixFmt)
+	return pixFmt == "yuv420p" || pixFmt == "yuvj420p"
+}
+
 // CanStreamCopy returns true if the source codecs are compatible with -c copy splitting.
-// Requires H264 video + AAC audio + 8-bit pixel format.
+// Requires H264 video + AAC audio + 4:2:0 8-bit pixel format.
 func CanStreamCopy(videoCodec, audioCodec, pixFmt string) bool {
-	return IsH264Compatible(videoCodec) && IsAACCompatible(audioCodec) && !Is10Bit(pixFmt)
+	return IsH264Compatible(videoCodec) && IsAACCompatible(audioCodec) && Is420p(pixFmt)
 }
 
 // ReencodeToH264 converts a video to H.264/AAC format for Telegram compatibility

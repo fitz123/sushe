@@ -161,7 +161,10 @@ sudo mkdir -p /home/$REMOTE_USER/.config/sushe
 sudo chown -R $REMOTE_USER:$REMOTE_USER /home/$REMOTE_USER/sushe
 sudo chown -R $REMOTE_USER:$REMOTE_USER /tmp/sushe
 sudo chown -R $REMOTE_USER:$REMOTE_USER /var/lib/telegram-bot-api
-sudo chown -R $REMOTE_USER:$REMOTE_USER /home/$REMOTE_USER/.config
+# Scope ownership tightly: the .config dir itself + its sushe subtree only,
+# so re-runs don't clobber unrelated app configs that may live under ~/.config.
+sudo chown $REMOTE_USER:$REMOTE_USER /home/$REMOTE_USER/.config
+sudo chown -R $REMOTE_USER:$REMOTE_USER /home/$REMOTE_USER/.config/sushe
 sudo chmod 700 /home/$REMOTE_USER/.config/sushe
 REMOTE
 
@@ -178,9 +181,15 @@ transfer_cookies() {
         return 0
     fi
     log "Transferring cookies file..."
-    scp "$local_cookies" "$SSH_HOST:.config/sushe/cookies.txt"
-    ssh "$SSH_HOST" "chmod 600 ~/.config/sushe/cookies.txt"
-    success "Cookies file deployed"
+    # Stage to /tmp on the server (the SSH login user can write there
+    # regardless of who they are) then sudo-install to the absolute target
+    # path with sushe ownership and mode 0600. Direct scp to ~/.config/sushe
+    # would land in the SSH login user's home (e.g. /root/.config/...) when
+    # make deploy is run as an admin/root SSH user, NOT in /home/sushe/.config.
+    local tmp_remote="/tmp/sushe-cookies-$$"
+    scp "$local_cookies" "$SSH_HOST:$tmp_remote"
+    ssh "$SSH_HOST" "sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0600 $tmp_remote /home/$REMOTE_USER/.config/sushe/cookies.txt && rm $tmp_remote"
+    success "Cookies file deployed to /home/$REMOTE_USER/.config/sushe/cookies.txt"
 }
 
 # Transfer all binaries to server

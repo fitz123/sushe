@@ -46,22 +46,34 @@ ssh "$SSH_HOST" "mkdir -p ~/.config/sushe && chmod 700 ~/.config/sushe"
 scp "$LOCAL_COOKIES" "$SSH_HOST:.config/sushe/cookies.txt"
 ssh "$SSH_HOST" "chmod 600 $REMOTE_COOKIES_PATH && ls -la $REMOTE_COOKIES_PATH"
 
-# Step 3: pre-flight — verify drop-in is already installed (BEFORE restart).
-# We check both:
+# Step 3: pre-flight — verify the merged unit has both required directives
+# BEFORE we restart. We check:
 #   - merged Environment includes SUSHE_COOKIES (cookies path wired)
 #   - merged ReadWritePaths includes the cookies dir (yt-dlp can WRITE the
 #     refreshed cookies back; the unit hardens /home as ProtectHome=read-only,
-#     so without ReadWritePaths the cookies dir, yt-dlp crashes after every
-#     successful download with OSError: [Errno 30] Read-only file system)
-echo "==> Step 3: verify systemd drop-in is installed"
+#     so without ReadWritePaths covering the cookies dir, yt-dlp crashes
+#     after every successful download with OSError: [Errno 30] Read-only
+#     file system)
+echo "==> Step 3: verify sushe.service unit has cookies wired"
 MERGED_ENV="$(ssh "$SSH_HOST" "systemctl show sushe -p Environment --value")"
 MERGED_RWPATHS="$(ssh "$SSH_HOST" "systemctl show sushe -p ReadWritePaths --value")"
 COOKIES_DIR="$(dirname "$REMOTE_COOKIES_PATH")"
 
 env_ok=true
-rwpaths_ok=true
-grep -q "SUSHE_COOKIES=$REMOTE_COOKIES_PATH" <<<"$MERGED_ENV" || env_ok=false
-grep -qE "(^| )$COOKIES_DIR( |$)" <<<"$MERGED_RWPATHS" || rwpaths_ok=false
+rwpaths_ok=false
+# Use fixed-string grep for SUSHE_COOKIES match. systemctl prints multiple
+# Environment vars space-separated on one line, so we just need substring.
+grep -qF "SUSHE_COOKIES=$REMOTE_COOKIES_PATH" <<<"$MERGED_ENV" || env_ok=false
+
+# ReadWritePaths is space-separated; tokenize and compare exactly to avoid
+# regex escaping pitfalls (the cookies dir contains `.config`, where `.`
+# would be a wildcard in ERE and produce false positives).
+for path in $MERGED_RWPATHS; do
+    if [[ "$path" == "$COOKIES_DIR" ]]; then
+        rwpaths_ok=true
+        break
+    fi
+done
 
 if ! $env_ok || ! $rwpaths_ok; then
     printf >&2 'ERROR: sushe.service unit is missing required directives.\n'

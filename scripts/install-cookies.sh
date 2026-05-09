@@ -46,35 +46,52 @@ ssh "$SSH_HOST" "mkdir -p ~/.config/sushe && chmod 700 ~/.config/sushe"
 scp "$LOCAL_COOKIES" "$SSH_HOST:.config/sushe/cookies.txt"
 ssh "$SSH_HOST" "chmod 600 $REMOTE_COOKIES_PATH && ls -la $REMOTE_COOKIES_PATH"
 
-# Step 3: pre-flight — verify drop-in is already installed (BEFORE restart)
-echo "==> Step 3: verify systemd drop-in is installed"
+# Step 3: pre-flight — verify the merged unit has both required directives
+# BEFORE we restart. We check:
+#   - merged Environment includes SUSHE_COOKIES (cookies path wired)
+#   - merged ReadWritePaths includes the cookies dir (yt-dlp can WRITE the
+#     refreshed cookies back; the unit hardens /home as ProtectHome=read-only,
+#     so without ReadWritePaths covering the cookies dir, yt-dlp crashes
+#     after every successful download with OSError: [Errno 30] Read-only
+#     file system)
+echo "==> Step 3: verify sushe.service unit has cookies wired"
 MERGED_ENV="$(ssh "$SSH_HOST" "systemctl show sushe -p Environment --value")"
-if ! grep -q "SUSHE_COOKIES=$REMOTE_COOKIES_PATH" <<<"$MERGED_ENV"; then
-    # Use printf with explicit %s so the inline heredoc syntax in the printed
-    # admin instructions stays literal. Avoids confusion about variable
-    # expansion across the outer (printing) heredoc and the inner (instructional)
-    # heredoc — the printed text shows exactly what the admin should paste.
-    printf >&2 'ERROR: systemd drop-in not installed. Merged unit Environment is missing\n'
-    printf >&2 'SUSHE_COOKIES=%s.\n\n' "$REMOTE_COOKIES_PATH"
-    printf >&2 'The drop-in install is a ONE-TIME ADMIN STEP that requires unrestricted sudo\n'
-    printf >&2 '(the sushe operator only has narrow sudo for systemctl restart/status). Ask\n'
-    printf >&2 'the server admin to run, AS ROOT on the server:\n\n'
-    printf >&2 '    mkdir -p /etc/systemd/system/sushe.service.d\n'
-    printf >&2 "    cat > /etc/systemd/system/sushe.service.d/cookies.conf <<'CONF'\n"
-    printf >&2 '    [Service]\n'
-    printf >&2 '    Environment=SUSHE_COOKIES=%s\n' "$REMOTE_COOKIES_PATH"
-    printf >&2 '    CONF\n'
-    printf >&2 '    chmod 0644 /etc/systemd/system/sushe.service.d/cookies.conf\n'
-    printf >&2 '    systemctl daemon-reload\n'
-    printf >&2 '    # Verify before restart:\n'
-    printf >&2 '    systemctl show sushe -p Environment | grep SUSHE_COOKIES\n'
-    printf >&2 '    # Then re-run this script as the sushe operator.\n\n'
-    printf >&2 'After the admin completes those steps, re-run %s as the sushe operator.\n' "$0"
-    printf >&2 'The operator path (cookies refresh + restart + verify) does not need root.\n\n'
+MERGED_RWPATHS="$(ssh "$SSH_HOST" "systemctl show sushe -p ReadWritePaths --value")"
+COOKIES_DIR="$(dirname "$REMOTE_COOKIES_PATH")"
+
+env_ok=true
+rwpaths_ok=false
+# Use fixed-string grep for SUSHE_COOKIES match. systemctl prints multiple
+# Environment vars space-separated on one line, so we just need substring.
+grep -qF "SUSHE_COOKIES=$REMOTE_COOKIES_PATH" <<<"$MERGED_ENV" || env_ok=false
+
+# ReadWritePaths is space-separated; tokenize and compare exactly to avoid
+# regex escaping pitfalls (the cookies dir contains `.config`, where `.`
+# would be a wildcard in ERE and produce false positives).
+for path in $MERGED_RWPATHS; do
+    if [[ "$path" == "$COOKIES_DIR" ]]; then
+        rwpaths_ok=true
+        break
+    fi
+done
+
+if ! $env_ok || ! $rwpaths_ok; then
+    printf >&2 'ERROR: sushe.service unit is missing required directives.\n'
+    $env_ok     || printf >&2 '  - merged Environment missing SUSHE_COOKIES=%s\n' "$REMOTE_COOKIES_PATH"
+    $rwpaths_ok || printf >&2 '  - merged ReadWritePaths missing %s (needed because ProtectHome=read-only;\n    yt-dlp writes refreshed cookies on exit and would crash with EROFS otherwise)\n' "$COOKIES_DIR"
+    printf >&2 '\nUnit setup is part of make deploy (scripts/deploy.sh). Run that from a\n'
+    printf >&2 'machine whose SSH user has unrestricted sudo on the server (the sushe\n'
+    printf >&2 'operator user only has narrow sudo for systemctl restart/status):\n\n'
+    printf >&2 '    make deploy\n\n'
+    printf >&2 'deploy.sh writes /etc/systemd/system/sushe.service with Environment=\n'
+    printf >&2 'SUSHE_COOKIES=... and ReadWritePaths including the cookies dir, removes\n'
+    printf >&2 'any obsolete cookies drop-in, daemon-reloads, and restarts the service.\n'
+    printf >&2 'After it completes, re-run %s for routine cookies refresh.\n\n' "$0"
     printf >&2 -- '--- current merged Environment ---\n%s\n' "$MERGED_ENV"
+    printf >&2 -- '--- current merged ReadWritePaths ---\n%s\n' "$MERGED_RWPATHS"
     exit 1
 fi
-echo "    OK — merged unit has SUSHE_COOKIES=$REMOTE_COOKIES_PATH"
+echo "    OK — Environment has SUSHE_COOKIES, ReadWritePaths includes $COOKIES_DIR"
 
 # Step 4: restart (sudo systemctl restart sushe — IS in operator allowlist)
 echo "==> Step 4: sudo systemctl restart sushe"
@@ -98,24 +115,20 @@ echo
 echo "==> Cookies refresh complete. Smoke-test by sending a previously-failing Instagram URL to the bot."
 
 # ============================================================================
-# ONE-TIME ADMIN STEP (NOT performed by this script):
+# ONE-TIME UNIT SETUP (NOT performed by this script):
 #
-# The systemd drop-in must be installed once by a user with unrestricted sudo
-# (NOT the sushe operator). Run on the server, as root or via someone with full
-# sudo:
+# The sushe.service unit needs BOTH:
+#   - Environment=SUSHE_COOKIES=...   wires the cookies path into yt-dlp
+#   - ReadWritePaths=<cookies-dir>    lets yt-dlp WRITE refreshed cookies back.
+#     The unit sets ProtectHome=read-only, so without this entry yt-dlp
+#     crashes after every successful download with
+#     OSError: [Errno 30] Read-only file system.
 #
-#     mkdir -p /etc/systemd/system/sushe.service.d
-#     cat > /etc/systemd/system/sushe.service.d/cookies.conf <<'CONF'
-#     [Service]
-#     Environment=SUSHE_COOKIES=/home/sushe/.config/sushe/cookies.txt
-#     CONF
-#     chmod 0644 /etc/systemd/system/sushe.service.d/cookies.conf
-#     systemctl daemon-reload
-#     # Verify BEFORE restarting (Config Change Safety):
-#     systemctl show sushe -p Environment | grep SUSHE_COOKIES
-#     # Restart only after the verify line printed the expected value:
-#     systemctl restart sushe
+# Both are written by scripts/deploy.sh (make deploy) directly into the main
+# unit at /etc/systemd/system/sushe.service. Run make deploy from a machine
+# whose SSH user has unrestricted sudo on the server (the sushe operator
+# only has narrow sudo for systemctl restart/status, sushe-logs, etc.).
 #
-# Once that's done once, this script handles all routine refreshes (when the
-# Instagram session expires and a new cookies.txt needs to be deployed).
+# After deploy.sh has run once (or any subsequent re-run), this script handles
+# all routine cookies refreshes when the Instagram session expires.
 # ============================================================================

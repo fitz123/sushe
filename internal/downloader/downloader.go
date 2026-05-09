@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fitz123/sushe/internal/logger"
@@ -313,13 +314,25 @@ func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback)
 		return fmt.Errorf("failed to start yt-dlp: %w", err)
 	}
 
-	// Read both stdout and stderr
+	// Capture stderr while still logging each line at Debug. The buffer is
+	// surfaced in the returned error so the user sees yt-dlp's actual cause
+	// (rate-limit, login required, etc.) instead of plain "exit status 1".
+	var stderrBuf strings.Builder
+	var stderrMu sync.Mutex
+	var stderrWg sync.WaitGroup
+
 	scanner := bufio.NewScanner(stdout)
+	stderrWg.Add(1)
 	go func() {
-		// Drain stderr to prevent blocking
+		defer stderrWg.Done()
 		stderrScanner := bufio.NewScanner(stderr)
 		for stderrScanner.Scan() {
-			logger.Debug("yt-dlp stderr", "line", stderrScanner.Text())
+			line := stderrScanner.Text()
+			logger.Debug("yt-dlp stderr", "line", line)
+			stderrMu.Lock()
+			stderrBuf.WriteString(line)
+			stderrBuf.WriteByte('\n')
+			stderrMu.Unlock()
 		}
 	}()
 
@@ -351,7 +364,22 @@ func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback)
 		}
 	}
 
-	return cmd.Wait()
+	waitErr := cmd.Wait()
+	stderrWg.Wait()
+	return formatYtdlpError(waitErr, stderrBuf.String())
+}
+
+// formatYtdlpError wraps a yt-dlp execution error with captured stderr so
+// callers see the underlying cause. Returns err unchanged when stderr is empty.
+func formatYtdlpError(err error, stderr string) error {
+	if err == nil {
+		return nil
+	}
+	stderr = strings.TrimSpace(stderr)
+	if stderr == "" {
+		return err
+	}
+	return fmt.Errorf("%w - %s", err, stderr)
 }
 
 // GetPlaylistInfo checks if a URL is a playlist and returns playlist information

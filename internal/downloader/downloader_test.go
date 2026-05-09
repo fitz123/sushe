@@ -1,6 +1,8 @@
 package downloader
 
 import (
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -142,4 +144,74 @@ func TestCanStreamCopyDecision(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFormatYtdlpError(t *testing.T) {
+	baseErr := errors.New("exit status 1")
+
+	tests := []struct {
+		name       string
+		err        error
+		stderr     string
+		wantNil    bool
+		wantSubstr []string
+	}{
+		{
+			name:    "nil error passes through",
+			err:     nil,
+			stderr:  "anything",
+			wantNil: true,
+		},
+		{
+			name:       "empty stderr returns err unchanged",
+			err:        baseErr,
+			stderr:     "",
+			wantSubstr: []string{"exit status 1"},
+		},
+		{
+			name:       "whitespace-only stderr returns err unchanged",
+			err:        baseErr,
+			stderr:     "   \n\t  \n",
+			wantSubstr: []string{"exit status 1"},
+		},
+		{
+			name:       "non-empty stderr appended to error",
+			err:        baseErr,
+			stderr:     "ERROR: [Instagram] DXXX: rate-limit reached or login required",
+			wantSubstr: []string{"exit status 1", "ERROR: [Instagram] DXXX: rate-limit reached or login required"},
+		},
+		{
+			name:       "stderr is trimmed",
+			err:        baseErr,
+			stderr:     "\n\nERROR: HTTP 429\n\n",
+			wantSubstr: []string{"exit status 1", "ERROR: HTTP 429"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatYtdlpError(tt.err, tt.stderr)
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil, got %v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected non-nil error")
+			}
+			for _, sub := range tt.wantSubstr {
+				if !strings.Contains(got.Error(), sub) {
+					t.Errorf("expected error to contain %q, got %q", sub, got.Error())
+				}
+			}
+		})
+	}
+
+	t.Run("wrapped error remains unwrappable", func(t *testing.T) {
+		wrapped := formatYtdlpError(baseErr, "ERROR: something")
+		if !errors.Is(wrapped, baseErr) {
+			t.Errorf("expected errors.Is to find base error in wrapped result")
+		}
+	})
 }

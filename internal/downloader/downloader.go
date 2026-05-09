@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fitz123/sushe/internal/logger"
@@ -313,13 +314,35 @@ func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback)
 		return fmt.Errorf("failed to start yt-dlp: %w", err)
 	}
 
-	// Read both stdout and stderr
+	// Capture stderr while still logging each line at Debug. The buffer is
+	// surfaced in the returned error so the user sees yt-dlp's actual cause
+	// (rate-limit, login required, etc.) instead of plain "exit status 1".
+	// Default bufio.Scanner cap is 64KB — yt-dlp can emit longer error lines
+	// (full tracebacks, JSON dumps), so bump to 1MB on both pipes; on overflow
+	// Scan returns false and we'd silently drop the rest of stderr (the very
+	// data this fix surfaces) plus risk blocking the child on a full pipe.
+	const scannerBufMax = 1 << 20 // 1 MB
+	var stderrBuf strings.Builder
+	var stderrMu sync.Mutex
+	var stderrWg sync.WaitGroup
+
 	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), scannerBufMax)
+	stderrWg.Add(1)
 	go func() {
-		// Drain stderr to prevent blocking
+		defer stderrWg.Done()
 		stderrScanner := bufio.NewScanner(stderr)
+		stderrScanner.Buffer(make([]byte, 64*1024), scannerBufMax)
 		for stderrScanner.Scan() {
-			logger.Debug("yt-dlp stderr", "line", stderrScanner.Text())
+			line := stderrScanner.Text()
+			logger.Debug("yt-dlp stderr", "line", line)
+			stderrMu.Lock()
+			stderrBuf.WriteString(line)
+			stderrBuf.WriteByte('\n')
+			stderrMu.Unlock()
+		}
+		if err := stderrScanner.Err(); err != nil {
+			logger.Warn("yt-dlp stderr scanner error", "error", err)
 		}
 	}()
 
@@ -350,8 +373,26 @@ func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback)
 			})
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		logger.Warn("yt-dlp stdout scanner error", "error", err)
+	}
 
-	return cmd.Wait()
+	waitErr := cmd.Wait()
+	stderrWg.Wait()
+	return formatYtdlpError(waitErr, stderrBuf.String())
+}
+
+// formatYtdlpError wraps a yt-dlp execution error with captured stderr so
+// callers see the underlying cause. Returns err unchanged when stderr is empty.
+func formatYtdlpError(err error, stderr string) error {
+	if err == nil {
+		return nil
+	}
+	stderr = strings.TrimSpace(stderr)
+	if stderr == "" {
+		return err
+	}
+	return fmt.Errorf("%w - %s", err, stderr)
 }
 
 // GetPlaylistInfo checks if a URL is a playlist and returns playlist information

@@ -26,7 +26,11 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     -o bin/sushe cmd/sushe/main.go
 
 echo "Transferring binary..."
-TMP_BIN="/tmp/sushe-update-$$"
+# Use remote-side mktemp for unique paths (local $$ can collide across
+# operators running concurrent updates from different machines).
+TMP_BIN="$(ssh "$SSH_HOST" 'mktemp /tmp/sushe-update-XXXXXX')"
+# Local trap so the remote temp file is cleaned up even if a later step fails.
+trap 'ssh "$SSH_HOST" "rm -f $TMP_BIN" 2>/dev/null || true' EXIT
 scp bin/sushe "$SSH_HOST:$TMP_BIN"
 
 echo "Pre-flight check..."
@@ -37,7 +41,7 @@ echo "Installing binary and restarting..."
 # sudo install handles the chown+chmod+atomic-rename in one go. Owner and
 # group set to REMOTE_USER so the service user owns its own binary even when
 # we ssh in as a different admin account.
-ssh "$SSH_HOST" "sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0755 $TMP_BIN /home/$REMOTE_USER/sushe/bin/sushe && rm -f $TMP_BIN"
+ssh "$SSH_HOST" "sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0755 $TMP_BIN /home/$REMOTE_USER/sushe/bin/sushe"
 ssh "$SSH_HOST" "sudo systemctl restart sushe"
 
 sleep 2

@@ -38,6 +38,10 @@ load_env() {
     # Validate required variables
     [[ -z "${TELEGRAM_API_ID:-}" ]] && error "TELEGRAM_API_ID not set in .env"
     [[ -z "${TELEGRAM_API_HASH:-}" ]] && error "TELEGRAM_API_HASH not set in .env"
+    # SSH_PUBLIC_KEY must be non-empty: the setup_user append-if-missing logic
+    # would otherwise grep for an empty string and append a blank line on every
+    # run, leaving the account without a usable key while still reporting OK.
+    [[ -z "${SSH_PUBLIC_KEY// /}" ]] && error "SSH_PUBLIC_KEY not set (or whitespace-only) in .env"
     log "Validation passed"
 }
 
@@ -195,9 +199,16 @@ transfer_cookies() {
     # path with sushe ownership and mode 0600. Direct scp to ~/.config/sushe
     # would land in the SSH login user's home (e.g. /root/.config/...) when
     # make deploy is run as an admin/root SSH user, NOT in /home/sushe/.config.
-    local tmp_remote="/tmp/sushe-cookies-$$"
+    # mktemp on the remote avoids local $$ collisions; trap ensures cleanup
+    # even if install fails.
+    local tmp_remote
+    tmp_remote="$(ssh "$SSH_HOST" 'mktemp /tmp/sushe-cookies-XXXXXX')"
     scp "$local_cookies" "$SSH_HOST:$tmp_remote"
-    ssh "$SSH_HOST" "sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0600 $tmp_remote /home/$REMOTE_USER/.config/sushe/cookies.txt && rm $tmp_remote"
+    ssh "$SSH_HOST" bash -s <<REMOTE
+set -e
+trap 'rm -f $tmp_remote' EXIT
+sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0600 $tmp_remote /home/$REMOTE_USER/.config/sushe/cookies.txt
+REMOTE
     success "Cookies file deployed to /home/$REMOTE_USER/.config/sushe/cookies.txt"
 }
 
@@ -206,20 +217,25 @@ transfer_cookies() {
 # of identity), then sudo install to the absolute target with REMOTE_USER
 # ownership and exec mode. Direct scp to /home/$REMOTE_USER/sushe/bin/ fails
 # when the SSH login user (admin) differs from REMOTE_USER (service user).
+# Uses remote-side mktemp for unique paths (local $$ can collide across
+# operators) and a remote trap so tmp files are cleaned up even if install
+# fails.
 transfer_binaries() {
     log "Transferring binaries to server..."
 
-    local tmp_tba="/tmp/sushe-tba-$$"
-    local tmp_bot="/tmp/sushe-bin-$$"
+    local tmp_tba tmp_bot
+    tmp_tba="$(ssh "$SSH_HOST" 'mktemp /tmp/sushe-tba-XXXXXX')"
+    tmp_bot="$(ssh "$SSH_HOST" 'mktemp /tmp/sushe-bin-XXXXXX')"
 
     scp "$BIN_DIR/telegram-bot-api" "$SSH_HOST:$tmp_tba"
     scp "$BIN_DIR/sushe" "$SSH_HOST:$tmp_bot"
 
-    ssh "$SSH_HOST" "
-        sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0755 $tmp_tba /home/$REMOTE_USER/sushe/bin/telegram-bot-api &&
-        sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0755 $tmp_bot /home/$REMOTE_USER/sushe/bin/sushe &&
-        rm -f $tmp_tba $tmp_bot
-    "
+    ssh "$SSH_HOST" bash -s <<REMOTE
+set -e
+trap 'rm -f $tmp_tba $tmp_bot' EXIT
+sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0755 $tmp_tba /home/$REMOTE_USER/sushe/bin/telegram-bot-api
+sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0755 $tmp_bot /home/$REMOTE_USER/sushe/bin/sushe
+REMOTE
 
     success "Binaries transferred"
 }

@@ -127,22 +127,23 @@ func New(cookiesPath string) *Downloader {
 
 	// One-time readability check on the cookies file so a misconfigured
 	// SUSHE_COOKIES path surfaces clearly at startup instead of as an
-	// opaque yt-dlp error on the first download. We need both os.Stat
-	// and os.Open because each catches a failure mode the other misses:
-	//   - os.Stat alone misses read-permission failures (a file owned
-	//     by root with mode 0600 would pass os.Stat but fail at
+	// opaque yt-dlp error on the first download. We layer three checks
+	// because each catches a failure mode the others miss:
+	//   - os.Stat catches missing path / permission-denied at the directory
+	//     level. By itself it misses read-permission failures on the file
+	//     (a file owned by root with mode 0600 passes os.Stat but fails at
 	//     yt-dlp read time).
-	//   - os.Open alone misses the directory case: on Linux,
-	//     os.Open("/some/dir") succeeds for a readable directory, so a
-	//     directory path in SUSHE_COOKIES would pass startup validation
-	//     but make every `yt-dlp --cookies <dir>` call fail later.
+	//   - info.Mode().IsRegular() rejects FIFOs / devices / sockets /
+	//     directories. os.Open on a FIFO can block; on a directory it
+	//     succeeds on Linux, masking a misconfigured path.
+	//   - os.Open exercises the actual read permission yt-dlp will need.
 	if cookiesPath != "" {
 		if info, err := os.Stat(cookiesPath); err != nil {
 			logger.Warn("Cookies file not readable; yt-dlp calls will likely fail",
 				"path", cookiesPath, "error", err)
-		} else if info.IsDir() {
-			logger.Warn("Cookies path is a directory, not a file; yt-dlp calls will likely fail",
-				"path", cookiesPath)
+		} else if !info.Mode().IsRegular() {
+			logger.Warn("Cookies path is not a regular file; yt-dlp calls will likely fail",
+				"path", cookiesPath, "mode", info.Mode().String())
 		} else if f, err := os.Open(cookiesPath); err != nil {
 			logger.Warn("Cookies file not readable; yt-dlp calls will likely fail",
 				"path", cookiesPath, "error", err)

@@ -50,31 +50,28 @@ ssh "$SSH_HOST" "chmod 600 $REMOTE_COOKIES_PATH && ls -la $REMOTE_COOKIES_PATH"
 echo "==> Step 3: verify systemd drop-in is installed"
 MERGED_ENV="$(ssh "$SSH_HOST" "systemctl show sushe -p Environment --value")"
 if ! grep -q "SUSHE_COOKIES=$REMOTE_COOKIES_PATH" <<<"$MERGED_ENV"; then
-    cat >&2 <<EOF
-ERROR: systemd drop-in not installed. Merged unit Environment is missing
-SUSHE_COOKIES=$REMOTE_COOKIES_PATH.
-
-The drop-in install is a ONE-TIME ADMIN STEP that requires unrestricted sudo
-(the sushe operator only has narrow sudo for systemctl restart/status). Ask
-the server admin to run, AS ROOT on the server:
-
-    mkdir -p /etc/systemd/system/sushe.service.d
-    cat > /etc/systemd/system/sushe.service.d/cookies.conf <<'CONF'
-    [Service]
-    Environment=SUSHE_COOKIES=$REMOTE_COOKIES_PATH
-    CONF
-    chmod 0644 /etc/systemd/system/sushe.service.d/cookies.conf
-    systemctl daemon-reload
-    # Verify before restart:
-    systemctl show sushe -p Environment | grep SUSHE_COOKIES
-    # Then re-run this script as the sushe operator.
-
-After the admin completes those steps, re-run \`$0\` as the sushe operator.
-The operator path (cookies refresh + restart + verify) does not need root.
-
---- current merged Environment ---
-$MERGED_ENV
-EOF
+    # Use printf with explicit %s so the inline heredoc syntax in the printed
+    # admin instructions stays literal. Avoids confusion about variable
+    # expansion across the outer (printing) heredoc and the inner (instructional)
+    # heredoc — the printed text shows exactly what the admin should paste.
+    printf >&2 'ERROR: systemd drop-in not installed. Merged unit Environment is missing\n'
+    printf >&2 'SUSHE_COOKIES=%s.\n\n' "$REMOTE_COOKIES_PATH"
+    printf >&2 'The drop-in install is a ONE-TIME ADMIN STEP that requires unrestricted sudo\n'
+    printf >&2 '(the sushe operator only has narrow sudo for systemctl restart/status). Ask\n'
+    printf >&2 'the server admin to run, AS ROOT on the server:\n\n'
+    printf >&2 '    mkdir -p /etc/systemd/system/sushe.service.d\n'
+    printf >&2 "    cat > /etc/systemd/system/sushe.service.d/cookies.conf <<'CONF'\n"
+    printf >&2 '    [Service]\n'
+    printf >&2 '    Environment=SUSHE_COOKIES=%s\n' "$REMOTE_COOKIES_PATH"
+    printf >&2 '    CONF\n'
+    printf >&2 '    chmod 0644 /etc/systemd/system/sushe.service.d/cookies.conf\n'
+    printf >&2 '    systemctl daemon-reload\n'
+    printf >&2 '    # Verify before restart:\n'
+    printf >&2 '    systemctl show sushe -p Environment | grep SUSHE_COOKIES\n'
+    printf >&2 '    # Then re-run this script as the sushe operator.\n\n'
+    printf >&2 'After the admin completes those steps, re-run %s as the sushe operator.\n' "$0"
+    printf >&2 'The operator path (cookies refresh + restart + verify) does not need root.\n\n'
+    printf >&2 -- '--- current merged Environment ---\n%s\n' "$MERGED_ENV"
     exit 1
 fi
 echo "    OK — merged unit has SUSHE_COOKIES=$REMOTE_COOKIES_PATH"

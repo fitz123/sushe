@@ -10,15 +10,19 @@ import (
 func TestCookieArgs(t *testing.T) {
 	tests := []struct {
 		name string
-		path string
-		want []string
+		path    string
+		want    []string
+		wantNil bool // empty path must return literal nil, not an empty slice
 	}{
-		{"empty path returns nil", "", nil},
-		{"non-empty path returns flag pair", "/etc/sushe/cookies.txt", []string{"--cookies", "/etc/sushe/cookies.txt"}},
+		{"empty path returns nil", "", nil, true},
+		{"non-empty path returns flag pair", "/etc/sushe/cookies.txt", []string{"--cookies", "/etc/sushe/cookies.txt"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := cookieArgs(tt.path)
+			if tt.wantNil && got != nil {
+				t.Errorf("cookieArgs(%q) = %v, want nil (slices.Equal(nil, []string{}) is true, so an explicit nil check is required)", tt.path, got)
+			}
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("cookieArgs(%q) = %v, want %v", tt.path, got, tt.want)
 			}

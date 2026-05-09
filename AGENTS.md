@@ -186,7 +186,7 @@ Note: `SUSHE_COOKIES` is set on the server via a systemd drop-in (see "Cookies f
 
 ### engine.go
 
-- `NewEngine()` - Create engine with downloader instance
+- `NewEngine(cookiesPath string)` - Create engine with downloader instance; pass `""` to disable cookies
 - `Process(ctx, url, progressCb)` - Download + codec check + transcode + split → ProcessResult
 - `ProcessPlaylist(ctx, url, progressCb)` - Process playlist → []ProcessResult
 - `IsPlaylist(ctx, url)` - Check if URL is a playlist
@@ -207,7 +207,7 @@ Note: `SUSHE_COOKIES` is set on the server via a systemd drop-in (see "Cookies f
 
 ### downloader.go
 
-- `Download(url, outputDir, progressCb)` - Download video with yt-dlp
+- `Download(ctx, url)` / `DownloadWithProgress(ctx, url, progressCb)` - Download video with yt-dlp
 - `GetVideoCodec(path)` - Get video codec via ffprobe
 - `GetAudioCodec(path)` - Get audio codec via ffprobe
 - `GetPixelFormat(path)` - Get pixel format via ffprobe
@@ -286,7 +286,7 @@ make build
 
 ## Dependencies
 
-- Go 1.21+
+- Go 1.23+
 - yt-dlp (on server)
 - ffmpeg/ffprobe (on server)
 - telegram-bot-api server (on server, for >50MB uploads)

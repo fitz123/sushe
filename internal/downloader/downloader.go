@@ -317,15 +317,22 @@ func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback)
 	// Capture stderr while still logging each line at Debug. The buffer is
 	// surfaced in the returned error so the user sees yt-dlp's actual cause
 	// (rate-limit, login required, etc.) instead of plain "exit status 1".
+	// Default bufio.Scanner cap is 64KB — yt-dlp can emit longer error lines
+	// (full tracebacks, JSON dumps), so bump to 1MB on both pipes; on overflow
+	// Scan returns false and we'd silently drop the rest of stderr (the very
+	// data this fix surfaces) plus risk blocking the child on a full pipe.
+	const scannerBufMax = 1 << 20 // 1 MB
 	var stderrBuf strings.Builder
 	var stderrMu sync.Mutex
 	var stderrWg sync.WaitGroup
 
 	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), scannerBufMax)
 	stderrWg.Add(1)
 	go func() {
 		defer stderrWg.Done()
 		stderrScanner := bufio.NewScanner(stderr)
+		stderrScanner.Buffer(make([]byte, 64*1024), scannerBufMax)
 		for stderrScanner.Scan() {
 			line := stderrScanner.Text()
 			logger.Debug("yt-dlp stderr", "line", line)
@@ -333,6 +340,9 @@ func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback)
 			stderrBuf.WriteString(line)
 			stderrBuf.WriteByte('\n')
 			stderrMu.Unlock()
+		}
+		if err := stderrScanner.Err(); err != nil {
+			logger.Warn("yt-dlp stderr scanner error", "error", err)
 		}
 	}()
 
@@ -362,6 +372,9 @@ func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback)
 				Percent: 100,
 			})
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		logger.Warn("yt-dlp stdout scanner error", "error", err)
 	}
 
 	waitErr := cmd.Wait()

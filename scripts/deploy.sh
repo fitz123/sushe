@@ -106,13 +106,22 @@ fi
 # Setup SSH directory
 sudo mkdir -p /home/$REMOTE_USER/.ssh
 sudo chmod 700 /home/$REMOTE_USER/.ssh
+sudo chown $REMOTE_USER:$REMOTE_USER /home/$REMOTE_USER/.ssh
 
-# Add SSH key (idempotent)
-echo "$SSH_PUBLIC_KEY" | sudo tee /home/$REMOTE_USER/.ssh/authorized_keys > /dev/null
+# Add SSH key idempotently. APPEND if missing — never overwrite the file.
+# An overwrite is destructive when REMOTE_USER points at an existing human
+# account with multiple admin keys in authorized_keys (real incident from
+# this repo: a deploy run with the wrong REMOTE_USER value clobbered the
+# admin's ssh keys and locked us out).
+sudo touch /home/$REMOTE_USER/.ssh/authorized_keys
 sudo chmod 600 /home/$REMOTE_USER/.ssh/authorized_keys
-sudo chown -R $REMOTE_USER:$REMOTE_USER /home/$REMOTE_USER/.ssh
-
-echo "SSH key configured"
+sudo chown $REMOTE_USER:$REMOTE_USER /home/$REMOTE_USER/.ssh/authorized_keys
+if ! sudo grep -qxF "$SSH_PUBLIC_KEY" /home/$REMOTE_USER/.ssh/authorized_keys; then
+    echo "$SSH_PUBLIC_KEY" | sudo tee -a /home/$REMOTE_USER/.ssh/authorized_keys > /dev/null
+    echo "SSH key added"
+else
+    echo "SSH key already present"
+fi
 REMOTE
 
     success "User setup complete"
@@ -192,14 +201,25 @@ transfer_cookies() {
     success "Cookies file deployed to /home/$REMOTE_USER/.config/sushe/cookies.txt"
 }
 
-# Transfer all binaries to server
+# Transfer all binaries to server.
+# Stage to /tmp on the server (the SSH login user can write there regardless
+# of identity), then sudo install to the absolute target with REMOTE_USER
+# ownership and exec mode. Direct scp to /home/$REMOTE_USER/sushe/bin/ fails
+# when the SSH login user (admin) differs from REMOTE_USER (service user).
 transfer_binaries() {
     log "Transferring binaries to server..."
 
-    scp "$BIN_DIR/telegram-bot-api" "$SSH_HOST:/home/$REMOTE_USER/sushe/bin/"
-    scp "$BIN_DIR/sushe" "$SSH_HOST:/home/$REMOTE_USER/sushe/bin/"
+    local tmp_tba="/tmp/sushe-tba-$$"
+    local tmp_bot="/tmp/sushe-bin-$$"
 
-    ssh "$SSH_HOST" "chmod +x ~/sushe/bin/*"
+    scp "$BIN_DIR/telegram-bot-api" "$SSH_HOST:$tmp_tba"
+    scp "$BIN_DIR/sushe" "$SSH_HOST:$tmp_bot"
+
+    ssh "$SSH_HOST" "
+        sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0755 $tmp_tba /home/$REMOTE_USER/sushe/bin/telegram-bot-api &&
+        sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0755 $tmp_bot /home/$REMOTE_USER/sushe/bin/sushe &&
+        rm -f $tmp_tba $tmp_bot
+    "
 
     success "Binaries transferred"
 }

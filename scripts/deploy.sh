@@ -157,12 +157,30 @@ set -e
 sudo mkdir -p /home/$REMOTE_USER/sushe/bin
 sudo mkdir -p /tmp/sushe
 sudo mkdir -p /var/lib/telegram-bot-api
+sudo mkdir -p /home/$REMOTE_USER/.config/sushe
 sudo chown -R $REMOTE_USER:$REMOTE_USER /home/$REMOTE_USER/sushe
 sudo chown -R $REMOTE_USER:$REMOTE_USER /tmp/sushe
 sudo chown -R $REMOTE_USER:$REMOTE_USER /var/lib/telegram-bot-api
+sudo chown -R $REMOTE_USER:$REMOTE_USER /home/$REMOTE_USER/.config
+sudo chmod 700 /home/$REMOTE_USER/.config/sushe
 REMOTE
 
     success "Directories ready"
+}
+
+# Transfer cookies file if it exists locally (optional — bot still starts
+# cleanly without cookies; SUSHE_COOKIES env var just produces a startup
+# warning if the file is unreadable).
+transfer_cookies() {
+    local local_cookies="$REPO_DIR/instagram-cookies.txt"
+    if [[ ! -f "$local_cookies" ]]; then
+        warn "No instagram-cookies.txt in repo root — bot will start without cookies (Instagram downloads will fail with login_required until cookies are deployed via scripts/install-cookies.sh)"
+        return 0
+    fi
+    log "Transferring cookies file..."
+    scp "$local_cookies" "$SSH_HOST:.config/sushe/cookies.txt"
+    ssh "$SSH_HOST" "chmod 600 ~/.config/sushe/cookies.txt"
+    success "Cookies file deployed"
 }
 
 # Transfer all binaries to server
@@ -220,7 +238,12 @@ setup_sushe_service() {
     ssh "$SSH_HOST" bash << REMOTE
 set -e
 
-# Create systemd service file
+# Create systemd service file. Cookies env + cookies dir in ReadWritePaths
+# are inline so the deploy is single-source-of-truth — no separate drop-in.
+# yt-dlp opens cookies file for read AND writes refreshed session cookies
+# back at exit, so the cookies dir MUST be in ReadWritePaths or yt-dlp
+# crashes after every download with OSError [Errno 30] Read-only file system
+# (because of ProtectHome=read-only).
 sudo tee /etc/systemd/system/sushe.service > /dev/null << EOF
 [Unit]
 Description=Sushe Video Downloader Telegram Bot
@@ -237,16 +260,24 @@ Restart=always
 RestartSec=5
 Environment=TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
 Environment=TELEGRAM_API_URL=http://localhost:8081
+Environment=SUSHE_COOKIES=/home/$REMOTE_USER/.config/sushe/cookies.txt
 
 # Security hardening
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/$REMOTE_USER/sushe /tmp/sushe
+ReadWritePaths=/home/$REMOTE_USER/sushe /tmp/sushe /home/$REMOTE_USER/.config/sushe
 PrivateTmp=false
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Remove any pre-existing cookies drop-in left over from the older
+# admin-installed flow — the directives above supersede it.
+if [[ -f /etc/systemd/system/sushe.service.d/cookies.conf ]]; then
+    sudo rm -f /etc/systemd/system/sushe.service.d/cookies.conf
+    sudo rmdir --ignore-fail-on-non-empty /etc/systemd/system/sushe.service.d 2>/dev/null || true
+fi
 
 sudo systemctl daemon-reload
 sudo systemctl enable sushe
@@ -301,6 +332,7 @@ main() {
     setup_ytdlp
     setup_directories
     transfer_binaries
+    transfer_cookies
     setup_telegram_bot_api_service
     setup_sushe_service
     verify

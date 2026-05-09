@@ -368,55 +368,29 @@ When the `SUSHE_COOKIES` env var is set on the server, the bot passes `--cookies
 - Owner: `sushe`
 - Format: Netscape-format cookies (export from a logged-in browser session)
 
-**One-time admin setup (NOT in the routine operator allowlist):**
+**Important:** the unit hardens `/home/` as read-only via `ProtectHome=read-only` plus a narrow `ReadWritePaths=` list. yt-dlp opens the cookies file for read at startup AND writes updated session cookies back at exit — so the cookies directory MUST be in `ReadWritePaths` or yt-dlp crashes after a successful download with `OSError: [Errno 30] Read-only file system`. `scripts/deploy.sh` writes the unit with both `Environment=SUSHE_COOKIES=...` and `ReadWritePaths=.../.config/sushe` inline, so this comes for free with `make deploy`.
 
-A human admin with sudo installs the systemd drop-in once. Per the "Forbidden: Modifying systemd unit files" rule above, drop-ins are out of scope for the routine operator action.
+**One-time / re-deploy admin setup:**
 
-Per the "Config Change Safety" rule, the procedure is split into three explicit steps so the config is verified BEFORE the service is restarted:
+`make deploy` (i.e. `scripts/deploy.sh`) handles the full setup, including:
+- creating `/home/sushe/.config/sushe/` (mode 0700, owner sushe)
+- transferring `instagram-cookies.txt` from the repo root if it exists locally (mode 0600)
+- writing `/etc/systemd/system/sushe.service` with `Environment=SUSHE_COOKIES=...` and `ReadWritePaths=.../.config/sushe` inline
+- removing any obsolete `cookies.conf` drop-in left over from earlier flows
+- `daemon-reload` + restart
 
-(a) Stage the drop-in file on the server:
-```
-printf '[Service]\nEnvironment=SUSHE_COOKIES=/home/sushe/.config/sushe/cookies.txt\n' > /tmp/cookies.conf
-scp /tmp/cookies.conf sushe:/tmp/cookies.conf
-rm /tmp/cookies.conf
-ssh sushe "sudo mkdir -p /etc/systemd/system/sushe.service.d && sudo install -m 0644 /tmp/cookies.conf /etc/systemd/system/sushe.service.d/cookies.conf && rm /tmp/cookies.conf"
-```
-
-(b) Verify the installed drop-in actually contains the expected `Environment=SUSHE_COOKIES=...` line BEFORE proceeding:
-```
-ssh sushe "cat /etc/systemd/system/sushe.service.d/cookies.conf"
-```
-Confirm the output contains `Environment=SUSHE_COOKIES=/home/sushe/.config/sushe/cookies.txt`.
-
-(c1) Only after (b) passes, reload systemd so it picks up the new drop-in (does NOT restart the running service):
-```
-ssh sushe "sudo systemctl daemon-reload"
-```
-
-(c2) Verify the merged systemd Environment for the unit contains the expected `SUSHE_COOKIES=...` token BEFORE restarting. `systemctl show` reads the merged unit + drop-ins (refreshed by c1), so this works without a restart:
-```
-ssh sushe "sudo systemctl show sushe -p Environment | grep SUSHE_COOKIES"
-```
-Confirm the output contains `SUSHE_COOKIES=/home/sushe/.config/sushe/cookies.txt`.
-
-(c3) Only after (c2) passes, restart the bot so the verified env reaches the running process:
-```
-ssh sushe "sudo systemctl restart sushe"
-```
+`scripts/deploy.sh` runs sudo commands on the server and must be invoked from a machine whose SSH user has unrestricted sudo there (NOT the `sushe` operator user — that one only has the narrow allowlist above).
 
 **Routine operator workflow (cookies refresh when session expires):**
 
-Instagram cookies typically last weeks-to-months. When the session expires the bot starts failing with `login required` again. Refresh:
+Instagram cookies typically last weeks-to-months. When the session expires the bot starts failing with `login required` again. Refresh from the local repo (no sudo on the operator side — only `systemctl restart sushe`, which is in the operator allowlist):
 
 ```
-ssh sushe "mkdir -p ~/.config/sushe && chmod 700 ~/.config/sushe"
-scp instagram-cookies.txt sushe:.config/sushe/cookies.txt
-ssh sushe "chmod 600 ~/.config/sushe/cookies.txt"
-ssh sushe "sudo systemctl restart sushe"
+./scripts/install-cookies.sh
 ```
 
-Only the cookies file is replaced; the systemd drop-in stays in place from the one-time setup.
+The script uploads the local `instagram-cookies.txt` to `~/.config/sushe/cookies.txt`, pre-flights `Environment` + `ReadWritePaths` on the server (aborts with a helpful message pointing at `make deploy` if the unit is missing the required directives), restarts via the allowlisted `sudo systemctl restart sushe`, and verifies the live process picked up the new env via `/proc/<MainPID>/environ`.
 
 **Hygiene:** use a dedicated Instagram account for the bot (not your personal one) to avoid the main account being flagged for unusual access patterns.
 
-**Do NOT** put `SUSHE_COOKIES` in `.env` — it is server-side config delivered via systemd drop-in. `.env` is for local-machine deploy config only.
+**Do NOT** put `SUSHE_COOKIES` in `.env` — it is server-side config written into the systemd unit by `scripts/deploy.sh`. `.env` is for local-machine deploy config only.

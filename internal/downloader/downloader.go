@@ -18,6 +18,17 @@ import (
 	"github.com/fitz123/sushe/internal/logger"
 )
 
+// cookieArgs returns yt-dlp cookie flags when path is non-empty, else nil.
+// The path is expected to be already trimmed by the caller (New canonicalizes
+// it once at construction). Returns a fresh slice each call so callers can
+// safely append onto it.
+func cookieArgs(path string) []string {
+	if path == "" {
+		return nil
+	}
+	return []string{"--cookies", path}
+}
+
 // Progress represents download progress information
 type Progress struct {
 	Phase      string  // "downloading", "processing", "merging", "encoding", "splitting", "uploading"
@@ -97,15 +108,54 @@ type DownloadResult struct {
 type Downloader struct {
 	downloadDir string
 	timeout     time.Duration
+	cookiesPath string
 }
 
-func New() *Downloader {
+// New creates a Downloader. If cookiesPath is non-empty, every yt-dlp invocation
+// is passed `--cookies <path>` so authenticated sessions (e.g. Instagram) work.
+// Pass "" to disable cookies. The path is trimmed of surrounding whitespace
+// (defends against misconfigured systemd Environment= lines with trailing
+// space/tab). Logs a warning if cookiesPath is non-empty but unreadable, so
+// misconfiguration surfaces at startup instead of as an opaque yt-dlp error.
+func New(cookiesPath string) *Downloader {
 	// Ensure download directory exists
 	os.MkdirAll(DownloadDir, 0755)
+
+	// Canonicalize once: trim surrounding whitespace so all downstream
+	// consumers (cookieArgs, the os.Stat check below) see the same value.
+	cookiesPath = strings.TrimSpace(cookiesPath)
+
+	// One-time readability check on the cookies file so a misconfigured
+	// SUSHE_COOKIES path surfaces clearly at startup instead of as an
+	// opaque yt-dlp error on the first download. We layer three checks
+	// because each catches a failure mode the others miss:
+	//   - os.Stat catches missing path / permission-denied at the directory
+	//     level. By itself it misses read-permission failures on the file
+	//     (a file owned by root with mode 0600 passes os.Stat but fails at
+	//     yt-dlp read time).
+	//   - info.Mode().IsRegular() rejects FIFOs / devices / sockets /
+	//     directories. os.Open on a FIFO can block; on a directory it
+	//     succeeds on Linux, masking a misconfigured path.
+	//   - os.Open exercises the actual read permission yt-dlp will need.
+	if cookiesPath != "" {
+		if info, err := os.Stat(cookiesPath); err != nil {
+			logger.Warn("Cookies file not readable; yt-dlp calls will likely fail",
+				"path", cookiesPath, "error", err)
+		} else if !info.Mode().IsRegular() {
+			logger.Warn("Cookies path is not a regular file; yt-dlp calls will likely fail",
+				"path", cookiesPath, "mode", info.Mode().String())
+		} else if f, err := os.Open(cookiesPath); err != nil {
+			logger.Warn("Cookies file not readable; yt-dlp calls will likely fail",
+				"path", cookiesPath, "error", err)
+		} else {
+			f.Close()
+		}
+	}
 
 	return &Downloader{
 		downloadDir: DownloadDir,
 		timeout:     DefaultTimeout,
+		cookiesPath: cookiesPath,
 	}
 }
 
@@ -129,7 +179,7 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	// Build yt-dlp command
 	// Use --newline for parseable progress output
 	// Prefer H.264 sources to avoid re-encoding, but accept any codec (will re-encode later if needed)
-	args := []string{
+	args := append(cookieArgs(d.cookiesPath),
 		"--no-playlist",
 		// Prefer H.264 (avc1) video + AAC audio sources to avoid re-encoding
 		// Falls back to any codec if H.264 not available
@@ -141,7 +191,7 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 		"--progress",
 		"--newline",
 		url,
-	}
+	)
 
 	logger.Debug("Running yt-dlp", "args", args)
 
@@ -398,12 +448,12 @@ func formatYtdlpError(err error, stderr string) error {
 // GetPlaylistInfo checks if a URL is a playlist and returns playlist information
 func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*PlaylistInfo, error) {
 	// Use yt-dlp with --flat-playlist --dump-json to check if it's a playlist
-	args := []string{
+	args := append(cookieArgs(d.cookiesPath),
 		"--flat-playlist",
 		"--dump-json",
 		"--no-warnings",
 		url,
-	}
+	)
 
 	logger.Debug("Checking if URL is playlist", "args", args)
 
@@ -522,7 +572,7 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 
 	// Build yt-dlp command for specific playlist item
 	// Remove --no-playlist and use --playlist-items to download specific video
-	args := []string{
+	args := append(cookieArgs(d.cookiesPath),
 		fmt.Sprintf("--playlist-items=%d", videoIndex+1), // yt-dlp uses 1-based indexing
 		"-f", "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc][height<=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
 		"--merge-output-format", "mp4",
@@ -531,7 +581,7 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 		"--progress",
 		"--newline",
 		playlistURL,
-	}
+	)
 
 	logger.Debug("Downloading playlist video", "index", videoIndex, "args", args)
 

@@ -19,7 +19,7 @@ func init() {
 
 func newTestService(t *testing.T) *APIService {
 	// Create API service with nil bot (tests that don't upload won't need it)
-	eng := engine.NewEngine()
+	eng := engine.NewEngine("")
 	svc := NewAPIService(eng, nil, "test-secret-token")
 	t.Cleanup(func() { svc.Close() })
 	return svc
@@ -203,7 +203,7 @@ func TestInvalidURLScheme(t *testing.T) {
 }
 
 func TestNewAPIService(t *testing.T) {
-	eng := engine.NewEngine()
+	eng := engine.NewEngine("")
 	svc := NewAPIService(eng, nil, "my-token")
 	assert.NotNil(t, svc)
 	assert.Equal(t, "my-token", svc.token)

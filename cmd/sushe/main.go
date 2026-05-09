@@ -93,7 +93,11 @@ func main() {
 	allowedUsers := bot.LoadAllowedUsers()
 
 	// Create shared download engine
-	eng := engine.NewEngine()
+	// SUSHE_COOKIES is an optional absolute path to a Netscape-format cookies file
+	// passed to every yt-dlp invocation as --cookies <path>. Empty disables cookies.
+	// Trim once at the boundary so trailing whitespace from a systemd Environment=
+	// line doesn't yield a malformed path.
+	eng := engine.NewEngine(strings.TrimSpace(os.Getenv("SUSHE_COOKIES")))
 
 	// Initialize bot service
 	botService := bot.NewBotService(botInstance, eng, allowedUsers)

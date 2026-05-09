@@ -177,7 +177,7 @@ func TestAdaptProgressCbSplitting(t *testing.T) {
 }
 
 func TestNewEngine(t *testing.T) {
-	eng := NewEngine()
+	eng := NewEngine("")
 	assert.NotNil(t, eng)
 	assert.NotNil(t, eng.downloader)
 }

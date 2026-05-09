@@ -17,9 +17,10 @@ type Engine struct {
 }
 
 // NewEngine creates a new Engine with a fresh Downloader instance.
-func NewEngine() *Engine {
+// cookiesPath is forwarded to the Downloader; pass "" to disable cookies.
+func NewEngine(cookiesPath string) *Engine {
 	return &Engine{
-		downloader: downloader.New(),
+		downloader: downloader.New(cookiesPath),
 	}
 }
 

@@ -2,9 +2,45 @@ package downloader
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestCookieArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want []string
+	}{
+		{"empty path returns nil", "", nil},
+		{"non-empty path returns flag pair", "/etc/sushe/cookies.txt", []string{"--cookies", "/etc/sushe/cookies.txt"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := cookieArgs(tt.path)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("cookieArgs(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCookieArgsAppendSafe verifies that callers can safely append onto the
+// returned slice without aliasing other call sites. Uses the same input for
+// both calls so any shared internal cache would cause cross-contamination.
+func TestCookieArgsAppendSafe(t *testing.T) {
+	a := append(cookieArgs("/x"), "tail-a")
+	b := append(cookieArgs("/x"), "tail-b")
+	wantA := []string{"--cookies", "/x", "tail-a"}
+	wantB := []string{"--cookies", "/x", "tail-b"}
+	if !slices.Equal(a, wantA) {
+		t.Errorf("a = %v, want %v", a, wantA)
+	}
+	if !slices.Equal(b, wantB) {
+		t.Errorf("b = %v, want %v", b, wantB)
+	}
+}
 
 func TestIsH264Compatible(t *testing.T) {
 	tests := []struct {

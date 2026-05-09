@@ -50,7 +50,7 @@ func main() {
 	fmt.Println("\n=== Testing SplitVideo ===")
 	fmt.Println("(This will split the 10-second video into 1 part since it's small)")
 
-	d := downloader.New()
+	d := downloader.New("")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 

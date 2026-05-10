@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fitz123/sushe/internal/downloader"
 	"github.com/fitz123/sushe/internal/engine"
 	"github.com/fitz123/sushe/internal/logger"
 	"github.com/fitz123/sushe/internal/upload"
@@ -139,8 +140,34 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 	// Write started event
 	writeJSON(w, flusher, ProgressEvent{Status: "started", URL: req.URL})
 
-	// Check if playlist
-	isPlaylist, playlistInfo, _ := s.engine.IsPlaylist(ctx, req.URL)
+	// Check if playlist.
+	//
+	// Error handling: IsPlaylist is best-effort for most URLs (yt-dlp metadata
+	// hiccup → fall through to single-video Process which has its own error
+	// path). EXCEPTION: Instagram `/p/<id>` URLs may be carousels AND the
+	// preflight failed with an IG rate-limit / login-required signal. In that
+	// case the single-video fallthrough would run yt-dlp with `--no-playlist`
+	// and either (a) silently download only the first carousel item or (b)
+	// hit the same rate-limit and return a misleading "failed to download"
+	// error. Surface the preflight error as a terminal NDJSON event so the
+	// API caller sees the actual rate-limit cause and can retry.
+	//
+	// IMPORTANT: only IG rate-limit / login-required errors surface. The
+	// benign "not a playlist - single video detected" sentinel from
+	// GetPlaylistInfo for ordinary single `/p/` posts must fall through to
+	// the single-video Process path — otherwise every valid single `/p/`
+	// post would be rejected with a confusing "failed to check Instagram
+	// carousel" error.
+	isPlaylist, playlistInfo, err := s.engine.IsPlaylist(ctx, req.URL)
+	if err != nil && downloader.IsInstagramPotentialCarousel(req.URL) && downloader.IsIGRateLimit(err) {
+		s.dedup.Release(dedupKey)
+		writeJSON(w, flusher, ResultEvent{
+			Status: "error",
+			OK:     false,
+			Error:  fmt.Sprintf("failed to check Instagram carousel: %v", err),
+		})
+		return
+	}
 	if isPlaylist && playlistInfo != nil {
 		s.handlePlaylistDownload(ctx, w, flusher, req, playlistInfo, dedupKey)
 		return
@@ -210,7 +237,12 @@ func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWr
 }
 
 // handlePlaylistDownload processes a playlist URL.
-func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, info interface{}, dedupKey string) {
+//
+// info is the *downloader.PlaylistInfo already obtained from IsPlaylist;
+// passing it through to ProcessPlaylist avoids a second yt-dlp metadata
+// fetch (which can rate-limit on IG /p/ carousels even when the first
+// succeeded).
+func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, info *downloader.PlaylistInfo, dedupKey string) {
 	var finalResult *ResultEvent
 	var handleErr error
 	defer func() {
@@ -232,7 +264,7 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 		})
 	}
 
-	results, err := s.engine.ProcessPlaylist(ctx, req.URL, progressCb)
+	results, err := s.engine.ProcessPlaylist(ctx, req.URL, info, progressCb)
 	if err != nil {
 		handleErr = err
 		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: err.Error()})

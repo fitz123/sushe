@@ -152,8 +152,30 @@ func (bs *BotService) processURL(c tele.Context, url string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	// First check if this is a playlist
-	isPlaylist, playlistInfo, _ := bs.engine.IsPlaylist(ctx, url)
+	// First check if this is a playlist.
+	//
+	// Error handling: IsPlaylist is best-effort for most URLs (yt-dlp metadata
+	// hiccup → fall through to single-video Process which has its own error
+	// path). EXCEPTION: Instagram `/p/<id>` URLs may be carousels AND the
+	// preflight failed with an IG rate-limit / login-required signal. In that
+	// case the single-video fallthrough would run yt-dlp with `--no-playlist`
+	// and either (a) silently download only the first carousel item or (b)
+	// hit the same rate-limit and return a misleading "failed to download"
+	// error. Surface the preflight error so the user sees the actual
+	// rate-limit cause and can retry.
+	//
+	// IMPORTANT: only IG rate-limit / login-required errors surface. The
+	// benign "not a playlist - single video detected" sentinel from
+	// GetPlaylistInfo for ordinary single `/p/` posts must fall through to
+	// the single-video Process path — otherwise every valid single `/p/`
+	// post would be rejected with a confusing "failed to check Instagram
+	// carousel" error.
+	isPlaylist, playlistInfo, err := bs.engine.IsPlaylist(ctx, url)
+	if err != nil && downloader.IsInstagramPotentialCarousel(url) && downloader.IsIGRateLimit(err) {
+		msg := fmt.Sprintf("Failed to check Instagram carousel: %v", err)
+		bs.bot.Send(c.Chat(), msg, &tele.SendOptions{ThreadID: c.Message().ThreadID})
+		return err
+	}
 	if isPlaylist && playlistInfo != nil {
 		return bs.processPlaylist(c, url, playlistInfo)
 	}
@@ -274,7 +296,10 @@ func (bs *BotService) processPlaylist(c tele.Context, playlistURL string, playli
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	results, err := bs.engine.ProcessPlaylist(ctx, playlistURL, progressCb)
+	// Pass the pre-fetched playlistInfo (from IsPlaylist) so ProcessPlaylist
+	// does not re-invoke yt-dlp metadata fetch — critical for IG /p/ carousels
+	// where the second hit can rate-limit even though the first succeeded.
+	results, err := bs.engine.ProcessPlaylist(ctx, playlistURL, playlistInfo, progressCb)
 	if err != nil {
 		bs.bot.Edit(statusMsg, fmt.Sprintf("Playlist download failed: %v", err))
 		return err

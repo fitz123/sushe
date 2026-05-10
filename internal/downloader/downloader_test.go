@@ -4,16 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fitz123/sushe/internal/logger"
 )
+
+func init() {
+	// The package-level logger is otherwise nil in test runs, which panics
+	// from any code path that logs (e.g. runWithCookieFallback's Debug call
+	// on every yt-dlp invocation). Initialize at warn to keep test output
+	// uncluttered while exercising real logger calls.
+	logger.Init("warn")
+}
 
 func TestCookieArgs(t *testing.T) {
 	tests := []struct {
-		name string
+		name    string
 		path    string
 		want    []string
 		wantNil bool // empty path must return literal nil, not an empty slice
@@ -932,26 +944,49 @@ func indexAllOf(haystack []string, target string) []int {
 }
 
 // TestIsInstagramSinglePost covers the URL classifier used by engine.IsPlaylist
-// to skip yt-dlp preflight for single-post IG URLs. Table-driven across the
-// three canonical post types (/p/, /reel/, /tv/), non-single-post IG paths
-// (explore, saved, stories, root), confusable hosts, and parse-error edges.
+// to skip yt-dlp preflight for guaranteed-single-video IG URLs. Table-driven
+// across the two canonical single-video post types (/reel/, /tv/),
+// non-single-post IG paths (explore, saved, stories, root), confusable hosts,
+// and parse-error edges.
+//
+// `/p/<id>` URLs are classified as NEGATIVE because Instagram serves both
+// single posts and carousel/sidecar posts (multiple media items) under `/p/`.
+// Short-circuiting all `/p/` URLs as single-video would silently drop carousel
+// items past the first; instead `/p/` URLs go through GetPlaylistInfo so
+// ProcessPlaylist can extract all carousel media.
 func TestIsInstagramSinglePost(t *testing.T) {
 	tests := []struct {
 		name   string
 		rawURL string
 		want   bool
 	}{
-		// Positive: canonical single-post URLs.
-		{"/p/<id>/", "https://www.instagram.com/p/CXXXXX/", true},
-		{"/p/<id> no trailing slash", "https://www.instagram.com/p/CXXXXX", true},
+		// Positive: guaranteed-single-video URLs.
 		{"/reel/<id>/", "https://www.instagram.com/reel/CYYYYY/", true},
 		{"/reel/<id> no trailing slash", "https://instagram.com/reel/CYYYYY", true},
 		{"/tv/<id>/", "https://www.instagram.com/tv/CZZZZZ/", true},
-		{"/p/<id>/ with query string", "https://www.instagram.com/p/CXXXXX/?igsh=abc123", true},
 		{"/reel/<id>/ with utm tracking", "https://www.instagram.com/reel/CYYYYY/?utm_source=ig", true},
-		{"m.instagram.com mobile subdomain", "https://m.instagram.com/p/CXXXXX/", true},
-		{"bare instagram.com (no www)", "https://instagram.com/p/CXXXXX/", true},
-		{"/p/<id>/sub-path", "https://www.instagram.com/p/CXXXXX/embed/", true},
+		{"m.instagram.com mobile subdomain", "https://m.instagram.com/reel/CYYYYY/", true},
+		{"bare instagram.com (no www) reel", "https://instagram.com/reel/CYYYYY/", true},
+		// Uppercase host coverage. url.URL.Hostname() does NOT normalize
+		// case, so without explicit lowercasing these would fall through
+		// to GetPlaylistInfo (the Layer-0 gate lowercases, so they ARE
+		// IG-classified upstream — mismatched behavior here would re-add
+		// the second yt-dlp hit Layer 2 was designed to eliminate).
+		{"all-caps host WWW.INSTAGRAM.COM /reel/", "https://WWW.INSTAGRAM.COM/reel/xyz", true},
+
+		// Negative: /p/ URLs — may be carousels (multiple media items),
+		// so MUST go through GetPlaylistInfo so ProcessPlaylist can extract
+		// all entries. Classifying them as single-video would force the
+		// `--no-playlist` download path and silently drop carousel items
+		// past the first. Single-post `/p/` URLs pay the extra metadata
+		// fetch to make this correct.
+		{"/p/<id>/ (may be carousel)", "https://www.instagram.com/p/CXXXXX/", false},
+		{"/p/<id> no trailing slash (may be carousel)", "https://www.instagram.com/p/CXXXXX", false},
+		{"/p/<id>/ with query string (may be carousel)", "https://www.instagram.com/p/CXXXXX/?igsh=abc123", false},
+		{"/p/<id>/sub-path (may be carousel)", "https://www.instagram.com/p/CXXXXX/embed/", false},
+		{"m.instagram.com /p/ (may be carousel)", "https://m.instagram.com/p/CXXXXX/", false},
+		{"bare instagram.com /p/ (may be carousel)", "https://instagram.com/p/CXXXXX/", false},
+		{"capitalized host Instagram.com /p/ (may be carousel)", "https://Instagram.com/p/abc/", false},
 
 		// Negative: IG host but not a single-post path.
 		{"root path", "https://www.instagram.com/", false},
@@ -962,9 +997,9 @@ func TestIsInstagramSinglePost(t *testing.T) {
 		{"/accounts/login", "https://www.instagram.com/accounts/login/", false},
 
 		// Negative: confusable hosts that must NOT match (security-critical).
-		{"evilinstagram.com host", "https://evilinstagram.com/p/CXXXXX/", false},
-		{"instagram.com.evil.com host", "https://instagram.com.evil.com/p/CXXXXX/", false},
-		{"non-IG host with /p/ path", "https://example.com/p/CXXXXX/", false},
+		{"evilinstagram.com host", "https://evilinstagram.com/reel/CXXXXX/", false},
+		{"instagram.com.evil.com host", "https://instagram.com.evil.com/reel/CXXXXX/", false},
+		{"non-IG host with /reel/ path", "https://example.com/reel/CXXXXX/", false},
 
 		// Negative: non-IG hosts entirely.
 		{"youtube watch URL", "https://www.youtube.com/watch?v=abc123", false},
@@ -978,6 +1013,73 @@ func TestIsInstagramSinglePost(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := IsInstagramSinglePost(tt.rawURL); got != tt.want {
 				t.Errorf("IsInstagramSinglePost(%q) = %v, want %v", tt.rawURL, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsInstagramPotentialCarousel covers the URL classifier used by bot and
+// api callers to decide whether an IsPlaylist preflight error must be
+// surfaced to the user. The check matches Instagram `/p/<id>` URLs — the
+// post type that may be a carousel/sidecar containing multiple media items.
+//
+// Symmetric with TestIsInstagramSinglePost: the two regexes split Instagram
+// post URLs into "guaranteed single" (/reel/, /tv/) vs "maybe carousel"
+// (/p/). A URL that lands in neither (profile pages, /explore/, /stories/,
+// non-IG hosts) returns false from both.
+func TestIsInstagramPotentialCarousel(t *testing.T) {
+	tests := []struct {
+		name   string
+		rawURL string
+		want   bool
+	}{
+		// Positive: /p/<id> URLs — may be carousels, error MUST propagate.
+		{"/p/<id>/", "https://www.instagram.com/p/CXXXXX/", true},
+		{"/p/<id> no trailing slash", "https://www.instagram.com/p/CXXXXX", true},
+		{"/p/<id>/ with utm tracking", "https://www.instagram.com/p/CXXXXX/?utm_source=ig", true},
+		{"/p/<id>/ with igsh query", "https://www.instagram.com/p/CXXXXX/?igsh=abc123", true},
+		{"/p/<id>/sub-path", "https://www.instagram.com/p/CXXXXX/embed/", true},
+		{"m.instagram.com /p/", "https://m.instagram.com/p/CXXXXX/", true},
+		{"bare instagram.com /p/", "https://instagram.com/p/CXXXXX/", true},
+		// Uppercase host coverage — host matching lowercases via
+		// isInstagramHost, so this MUST classify as carousel-candidate.
+		{"all-caps host WWW.INSTAGRAM.COM /p/", "https://WWW.INSTAGRAM.COM/p/xyz", true},
+		{"capitalized host Instagram.com /p/", "https://Instagram.com/p/abc/", true},
+
+		// Negative: /reel/ and /tv/ are guaranteed-single-video — preflight
+		// errors for these are benign because the single-video fallthrough
+		// will correctly download the one video.
+		{"/reel/<id>/", "https://www.instagram.com/reel/CYYYYY/", false},
+		{"/tv/<id>/", "https://www.instagram.com/tv/CZZZZZ/", false},
+
+		// Negative: IG host but not a post path — these never reach
+		// IsPlaylist with a preflight error in practice, but the classifier
+		// must still return false to avoid spurious error surfacing.
+		{"root path", "https://www.instagram.com/", false},
+		{"/explore/", "https://www.instagram.com/explore/", false},
+		{"/<username>/saved/", "https://www.instagram.com/some_user/saved/", false},
+		{"/stories/<user>/<id>", "https://www.instagram.com/stories/some_user/123456/", false},
+		{"/<username> profile only", "https://www.instagram.com/some_user/", false},
+
+		// Negative: confusable hosts that must NOT match (security-critical).
+		// A `/p/` URL on evilinstagram.com is a non-IG URL — error propagation
+		// here would attribute non-IG yt-dlp failures to Instagram.
+		{"evilinstagram.com /p/", "https://evilinstagram.com/p/CXXXXX/", false},
+		{"instagram.com.evil.com /p/", "https://instagram.com.evil.com/p/CXXXXX/", false},
+		{"non-IG host with /p/ path", "https://example.com/p/CXXXXX/", false},
+
+		// Negative: non-IG hosts entirely.
+		{"youtube watch URL", "https://www.youtube.com/watch?v=abc123", false},
+		{"tiktok URL", "https://www.tiktok.com/@user/video/12345", false},
+
+		// Edge: parse errors must return false (not panic, not true).
+		{"malformed URL with IPv6 bracket", "http://[::1", false},
+		{"empty string", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsInstagramPotentialCarousel(tt.rawURL); got != tt.want {
+				t.Errorf("IsInstagramPotentialCarousel(%q) = %v, want %v", tt.rawURL, got, tt.want)
 			}
 		})
 	}
@@ -1018,6 +1120,21 @@ func TestIsIGRateLimit(t *testing.T) {
 			errors.New("ERROR: [Instagram] story: login required to view this story"),
 			true,
 		},
+		// yt-dlp's story extractor capitalizes the L in "Login required"
+		// (whereas the post extractor uses lowercase). Both must match —
+		// otherwise the capital-L variant silently bypasses the cookies
+		// retry and the cooldown for IG story errors.
+		{
+			"capital-L Login required (story)",
+			errors.New("ERROR: [Instagram:story] 12345: Login required to view this content"),
+			true,
+		},
+		// Sanity: mixed-case HTTP error 429.
+		{
+			"mixed-case HTTP error 429",
+			errors.New("ERROR: unable to download video data: http error 429: Too Many Requests"),
+			true,
+		},
 
 		// Positive: wrapped errors. formatYtdlpError uses fmt.Errorf with %w
 		// in production, so the detector must walk the error chain (which
@@ -1047,11 +1164,20 @@ func TestIsIGRateLimit(t *testing.T) {
 		{"random go error", errors.New("connection refused"), false},
 		{"yt-dlp non-rate-limit stderr", fmt.Errorf("%w - %s", errors.New("exit status 1"), "ERROR: [generic] Unsupported URL"), false},
 		{"empty error message", errors.New(""), false},
+		// Negative regression (codex iter-5): the benign sentinel returned by
+		// GetPlaylistInfo when a /p/ URL turns out to be a single post must
+		// NOT trip the rate-limit detector. bot/api use IsIGRateLimit to
+		// decide whether to surface a /p/ IsPlaylist error vs fall through
+		// to single-video Process; surfacing this sentinel would reject
+		// every valid single /p/ post with a misleading "failed to check
+		// Instagram carousel" error.
+		{"not a playlist sentinel", errors.New("not a playlist - single video detected"), false},
+		{"wrapped not-a-playlist sentinel", fmt.Errorf("failed to get playlist info: %w", errors.New("not a playlist - single video detected")), false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isIGRateLimit(tt.err); got != tt.want {
-				t.Errorf("isIGRateLimit(%v) = %v, want %v", tt.err, got, tt.want)
+			if got := IsIGRateLimit(tt.err); got != tt.want {
+				t.Errorf("IsIGRateLimit(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
 	}
@@ -1060,8 +1186,8 @@ func TestIsIGRateLimit(t *testing.T) {
 	// so adding/removing one constant in the helper trips this test.
 	t.Run("each documented substring is independently detected", func(t *testing.T) {
 		for _, sub := range []string{ratelimitMsg, http429Msg, loginReqMsg} {
-			if !isIGRateLimit(errors.New("prefix: " + sub + " :suffix")) {
-				t.Errorf("documented substring %q not detected by isIGRateLimit", sub)
+			if !IsIGRateLimit(errors.New("prefix: " + sub + " :suffix")) {
+				t.Errorf("documented substring %q not detected by IsIGRateLimit", sub)
 			}
 		}
 	})
@@ -1163,7 +1289,7 @@ func TestNoteIGRateLimit(t *testing.T) {
 		}
 	})
 
-	t.Run("second noteIGRateLimit within window slides the deadline forward", func(t *testing.T) {
+	t.Run("second noteIGRateLimit slides deadline by elapsed-since-first, not by igCooldown", func(t *testing.T) {
 		d := &Downloader{}
 		d.noteIGRateLimit()
 		firstDeadline := d.igCooldownUntil
@@ -1217,6 +1343,72 @@ func TestNoteIGRateLimit(t *testing.T) {
 				eta, eta, minIGGap)
 		}
 	})
+
+	// Regression test for codex iter-5 race: a goroutine already waiting for
+	// a minIGGap slot must observe a cooldown that lands DURING its sleep,
+	// rather than waking on its original timer and proceeding into yt-dlp
+	// during the new cooldown.
+	t.Run("cooldown stamped mid-sleep extends the wait", func(t *testing.T) {
+		d := &Downloader{}
+		// 400ms remaining on the minIGGap spacing; no cooldown yet.
+		d.igLastAt = time.Now().Add(-(minIGGap - 400*time.Millisecond))
+
+		done := make(chan error, 1)
+		start := time.Now()
+		go func() {
+			done <- d.waitForIGSlot(context.Background(), "https://instagram.com/p/abc/", nil)
+		}()
+
+		// Wait ~150ms (the goroutine is now sleeping with ~250ms to go),
+		// then stamp a cooldown deadline 800ms into the future — this is
+		// strictly past the original wake time. Without the re-check loop
+		// the goroutine would return at ~start+400ms; WITH the re-check it
+		// must keep waiting until at least start+150ms+800ms = ~start+950ms.
+		time.Sleep(150 * time.Millisecond)
+		d.igMu.Lock()
+		d.igCooldownUntil = time.Now().Add(800 * time.Millisecond)
+		d.igMu.Unlock()
+
+		select {
+		case err := <-done:
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			// Must have waited past the cooldown extension. Floor is
+			// ~950ms; allow a small jitter window.
+			if elapsed < 850*time.Millisecond {
+				t.Errorf("waitForIGSlot returned in %v; expected >=850ms (cooldown set mid-sleep was ignored)", elapsed)
+			}
+			// Ceiling sanity: must not have waited an unbounded extra slot.
+			if elapsed > 2*time.Second {
+				t.Errorf("waitForIGSlot returned in %v; expected ~1s (cooldown re-check should not spin)", elapsed)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("waitForIGSlot did not return within 3s (deadlock?)")
+		}
+	})
+
+	// Companion to the race test: confirm that when NO cooldown is stamped
+	// during the sleep, the gate returns promptly on the original timer
+	// (the re-check loop must not introduce phantom waits).
+	t.Run("no cooldown mid-sleep returns on original timer", func(t *testing.T) {
+		d := &Downloader{}
+		d.igLastAt = time.Now().Add(-(minIGGap - 400*time.Millisecond))
+
+		start := time.Now()
+		err := d.waitForIGSlot(context.Background(), "https://instagram.com/p/abc/", nil)
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if elapsed < 300*time.Millisecond {
+			t.Errorf("waitForIGSlot returned in %v; expected ~400ms (gap honored)", elapsed)
+		}
+		if elapsed > 700*time.Millisecond {
+			t.Errorf("waitForIGSlot returned in %v; expected ~400ms (re-check loop added phantom wait)", elapsed)
+		}
+	})
 }
 
 // TestIGCooldownConstant locks the cooldown constant so accidental edits trip
@@ -1243,7 +1435,7 @@ func TestIGCooldownConstant(t *testing.T) {
 //     just waste an IG slot.
 func TestShouldRetryWithCookies(t *testing.T) {
 	const (
-		igRLMsg  = "rate-limit reached or login required"
+		igRLMsg    = "rate-limit reached or login required"
 		genericMsg = "ERROR: [generic] Unsupported URL"
 	)
 
@@ -1306,5 +1498,227 @@ func TestShouldRetryWithCookies(t *testing.T) {
 					tt.err, tt.cookiesPath, got, tt.want)
 			}
 		})
+	}
+}
+
+// installFakeYtdlp writes a shell script named "yt-dlp" into a temp dir and
+// prepends that dir to PATH for the duration of the test. The script writes
+// the literal argv it received (one per line) to outFile and exits with
+// exitCode (with optional stderr text). The fake never actually downloads
+// anything; runWithCookieFallback just sees the exit + stderr like the real
+// binary would. Returns the path to outFile so the test can assert on the
+// captured args.
+//
+// This is the load-bearing piece of the codex-iter-1 regression tests: we
+// need to see EXACTLY which yt-dlp invocations happen for an IG vs non-IG
+// URL (anonymous-first dance vs cookies-up-front) without taking on the
+// flakiness of mocking exec.Cmd. PATH-shim is the standard Go approach.
+func installFakeYtdlp(t *testing.T, exitCode int, stderr string) string {
+	t.Helper()
+	dir := t.TempDir()
+	outFile := filepath.Join(dir, "calls.log")
+	// Each invocation APPENDS its argv block separated by "---\n" so the
+	// test can count invocations and inspect each separately. Using `printf`
+	// not `echo -e` because the latter is non-portable across /bin/sh
+	// implementations.
+	script := fmt.Sprintf(`#!/bin/sh
+{
+  for a in "$@"; do
+    printf '%%s\n' "$a"
+  done
+  printf '%%s\n' '---'
+} >> %q
+printf '%%s' %q 1>&2
+exit %d
+`, outFile, stderr, exitCode)
+	scriptPath := filepath.Join(dir, "yt-dlp")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake yt-dlp: %v", err)
+	}
+	// Prepend dir to PATH. t.Setenv handles restore automatically.
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return outFile
+}
+
+// readFakeYtdlpInvocations parses the call log written by the fake yt-dlp
+// into one []string per invocation, in chronological order.
+func readFakeYtdlpInvocations(t *testing.T, logPath string) [][]string {
+	t.Helper()
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("read fake yt-dlp log: %v", err)
+	}
+	var calls [][]string
+	var current []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "---" {
+			calls = append(calls, current)
+			current = nil
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		current = append(current, line)
+	}
+	return calls
+}
+
+// hasArg returns true if args contains the literal `--cookies` flag.
+func hasCookiesArg(args []string) bool {
+	return slices.Contains(args, "--cookies")
+}
+
+// TestRunWithCookieFallback_NonIGUsesCookiesUpFront pins the regression fix
+// for codex iter-1: non-Instagram URLs (YouTube, Twitter, TikTok, etc.) must
+// receive `--cookies` on their FIRST and only yt-dlp invocation. Pre-fix,
+// every URL was forced through the anonymous-first dance — sites that
+// require auth (YouTube Premium, age-gated, login-walled) would fail the
+// anonymous attempt and never retry with cookies (because the retry was
+// gated on IsIGRateLimit, which doesn't fire for, e.g., generic 403).
+//
+// This test exits the fake yt-dlp with success so the helper takes the
+// happy path; the assertion is purely about which args reached the binary
+// on which attempts. A failure of this test means the regression is back.
+func TestRunWithCookieFallback_NonIGUsesCookiesUpFront(t *testing.T) {
+	logPath := installFakeYtdlp(t, 0, "")
+	workDir := t.TempDir()
+	d := &Downloader{
+		downloadDir: workDir,
+		timeout:     30 * time.Second,
+		cookiesPath: "/fake/cookies.txt",
+	}
+	const ytURL = "https://www.youtube.com/watch?v=abc123"
+
+	if err := d.runWithCookieFallback(context.Background(), ytURL, workDir, []string{ytURL}, nil); err != nil {
+		t.Fatalf("runWithCookieFallback: %v", err)
+	}
+
+	calls := readFakeYtdlpInvocations(t, logPath)
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 yt-dlp invocation for non-IG URL, got %d: %v", len(calls), calls)
+	}
+	if !hasCookiesArg(calls[0]) {
+		t.Errorf("non-IG URL invocation must include --cookies on the first attempt; got args=%v", calls[0])
+	}
+}
+
+// TestRunWithCookieFallback_IGAnonymousFirst pins the IG-only anonymous-first
+// behavior: an IG URL must trigger an anonymous attempt FIRST (no --cookies
+// flag), regardless of cookiesPath state. With a success exit, only one
+// invocation should occur and it must NOT carry --cookies.
+func TestRunWithCookieFallback_IGAnonymousFirst(t *testing.T) {
+	logPath := installFakeYtdlp(t, 0, "")
+	workDir := t.TempDir()
+	d := &Downloader{
+		downloadDir: workDir,
+		timeout:     30 * time.Second,
+		cookiesPath: "/fake/cookies.txt",
+	}
+	const igURL = "https://www.instagram.com/reel/ABC123/"
+
+	if err := d.runWithCookieFallback(context.Background(), igURL, workDir, []string{igURL}, nil); err != nil {
+		t.Fatalf("runWithCookieFallback: %v", err)
+	}
+
+	calls := readFakeYtdlpInvocations(t, logPath)
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 yt-dlp invocation for successful IG anonymous attempt, got %d: %v", len(calls), calls)
+	}
+	if hasCookiesArg(calls[0]) {
+		t.Errorf("IG URL anonymous-first invocation must NOT include --cookies; got args=%v", calls[0])
+	}
+}
+
+// TestRunWithCookieFallback_IGRetriesWithCookies pins the IG fallback path:
+// when the anonymous attempt fails with an IG rate-limit error and cookies
+// are configured, runWithCookieFallback must retry with --cookies. Both
+// invocations must be observed.
+func TestRunWithCookieFallback_IGRetriesWithCookies(t *testing.T) {
+	logPath := installFakeYtdlp(t, 1, "ERROR: [Instagram] foo: Requested content is not available, rate-limit reached or login required")
+	workDir := t.TempDir()
+	d := &Downloader{
+		downloadDir: workDir,
+		timeout:     30 * time.Second,
+		cookiesPath: "/fake/cookies.txt",
+	}
+	const igURL = "https://www.instagram.com/p/abc/"
+
+	// Both attempts will fail (fake exits 1 every time), but the helper must
+	// still issue the retry so we can observe it.
+	_ = d.runWithCookieFallback(context.Background(), igURL, workDir, []string{igURL}, nil)
+
+	calls := readFakeYtdlpInvocations(t, logPath)
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 yt-dlp invocations (anonymous + cookies retry), got %d: %v", len(calls), calls)
+	}
+	if hasCookiesArg(calls[0]) {
+		t.Errorf("IG first attempt must be anonymous; got args=%v", calls[0])
+	}
+	if !hasCookiesArg(calls[1]) {
+		t.Errorf("IG retry attempt must include --cookies; got args=%v", calls[1])
+	}
+}
+
+// TestRunWithCookieFallback_NonIGNoCooldown pins the second regression fix
+// for codex iter-1: a non-IG URL emitting a generic rate-limit-like error
+// string (HTTP 429 / login required — both common across yt-dlp extractors)
+// must NOT trigger noteIGRateLimit. Pre-fix, the bot would stall all future
+// IG downloads for 5 minutes any time a YouTube / Twitter / TikTok error
+// happened to include those substrings.
+func TestRunWithCookieFallback_NonIGNoCooldown(t *testing.T) {
+	// Use an error string that DOES match IsIGRateLimit's patterns, to make
+	// sure the gate is on URL host, not error content.
+	installFakeYtdlp(t, 1, "ERROR: [youtube] foo: HTTP Error 429: Too Many Requests")
+	workDir := t.TempDir()
+	d := &Downloader{
+		downloadDir: workDir,
+		timeout:     30 * time.Second,
+		cookiesPath: "/fake/cookies.txt",
+	}
+	const ytURL = "https://www.youtube.com/watch?v=abc"
+
+	_ = d.runWithCookieFallback(context.Background(), ytURL, workDir, []string{ytURL}, nil)
+
+	// igCooldownUntil must remain zero — the non-IG failure must not have
+	// stamped the global IG cooldown.
+	d.igMu.Lock()
+	cooldown := d.igCooldownUntil
+	d.igMu.Unlock()
+	if !cooldown.IsZero() {
+		t.Errorf("non-IG URL emitting 429 must NOT set igCooldownUntil; got %v (now=%v)", cooldown, time.Now())
+	}
+}
+
+// TestRunWithCookieFallback_IGSetsCooldown pins the positive side of the
+// gate: an IG URL hitting an IG-rate-limit error string must set the
+// cooldown so subsequent IG callers back off.
+func TestRunWithCookieFallback_IGSetsCooldown(t *testing.T) {
+	installFakeYtdlp(t, 1, "ERROR: [Instagram] foo: Requested content is not available, rate-limit reached or login required")
+	workDir := t.TempDir()
+	d := &Downloader{
+		downloadDir: workDir,
+		timeout:     30 * time.Second,
+		// Empty cookiesPath: no retry, single failing attempt, but the
+		// cooldown stamp must still fire because the error matches.
+		cookiesPath: "",
+	}
+	const igURL = "https://www.instagram.com/reel/abc/"
+
+	_ = d.runWithCookieFallback(context.Background(), igURL, workDir, []string{igURL}, nil)
+
+	d.igMu.Lock()
+	cooldown := d.igCooldownUntil
+	d.igMu.Unlock()
+	if cooldown.IsZero() {
+		t.Fatal("IG URL hitting rate-limit must set igCooldownUntil; got zero")
+	}
+	// Sanity-check the cooldown lands within (now, now+igCooldown+slack).
+	now := time.Now()
+	if cooldown.Before(now) || cooldown.After(now.Add(igCooldown+time.Second)) {
+		t.Errorf("igCooldownUntil = %v, want within (%v, %v]", cooldown, now, now.Add(igCooldown+time.Second))
 	}
 }

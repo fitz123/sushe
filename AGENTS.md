@@ -370,9 +370,17 @@ This section describes restricted access for an AI developer agent working on th
 
 ### Cookies for authenticated downloads
 
-Some platforms (notably Instagram) refuse to serve anonymous traffic and respond with `rate-limit reached or login required`, `HTTP 429`, or `Login required` to yt-dlp. In production, ~85% of Instagram failures fall into this auth/rate-limit class. Authenticated cookies bypass these.
+Some platforms (notably Instagram) refuse to serve anonymous traffic and respond with `rate-limit reached or login required`, `HTTP 429`, `login required`, or `Login required` to yt-dlp. yt-dlp emits both lowercase (`login required`, post errors) and capital-L (`Login required`, story errors) variants; the bot's `isIGRateLimit` detector lowercases before substring-matching so both cases trip the cookies fallback and the cooldown. In production, ~85% of Instagram failures fall into this auth/rate-limit class. Authenticated cookies bypass these.
 
-When the `SUSHE_COOKIES` env var is set on the server, the bot passes `--cookies <path>` to every yt-dlp invocation (single video, playlist info, playlist item). When unset, behavior is unchanged.
+When the `SUSHE_COOKIES` env var is set on the server, the bot uses an **anonymous-first with cookies fallback** strategy for downloads (`DownloadWithProgress` / `DownloadPlaylistVideo`):
+
+1. First attempt: yt-dlp runs WITHOUT `--cookies` (anonymous). Most public Instagram posts succeed here, keeping the bot's IG account off Meta's radar for the majority of traffic.
+2. If the anonymous attempt fails with an IG rate-limit / auth-required error (per `isIGRateLimit`), the partial output is swept from the work directory and the invocation is retried with `--cookies <path>`.
+3. On terminal IG-rate-limit failure (cookies retry also failed, or no cookies configured), `noteIGRateLimit()` is called — `igCooldownUntil` is set to now + `igCooldown` so the next IG-bound invocation across all goroutines waits out the cooldown via `waitForIGSlot`.
+
+`GetPlaylistInfo` (the metadata preflight) still passes `--cookies` up front — it's a single short request that runs once per user-pasted URL and is not the dominant source of traffic. The anonymous-first dance only applies to the heavier media-download invocations.
+
+When `SUSHE_COOKIES` is unset, behavior is unchanged: every invocation is anonymous, and IG auth-required errors surface to the user directly (no retry, but `noteIGRateLimit` still fires so the cooldown still throttles follow-on traffic).
 
 **File location on the server:**
 - Path: `/home/sushe/.config/sushe/cookies.txt`
@@ -410,45 +418,112 @@ The script uploads the local `www.instagram.com_cookies.txt` to `~/.config/sushe
 ### Instagram rate limiting
 
 Cookies alone are not enough — Instagram also flags bursty request patterns
-regardless of auth state. The bot adds two layers of anti-flag posture:
+regardless of auth state, and routes web-app traffic from datacenter IP
+ranges (e.g. Hetzner) onto a stricter rate-limit cluster. The bot stacks
+four layers of anti-flag posture (Layer 0 = at the request, Layer 3 = at
+the global cooldown):
 
-**Per-invocation throttling (`throttleArgs` in `downloader.go`)** — passed to
-every yt-dlp call:
+**Layer 0 — IG-specific extractor args (`igExtractorArgs` in `downloader.go`)**
+— appended AFTER `throttleArgs` and `cookieArgs` for IG URLs only, so the
+IG-specific values override the generic throttle defaults via yt-dlp's
+last-wins arg parsing:
+
+- `--extractor-args instagram:app_id=124024574287414` (iOS-app id; yt-dlp
+  PR #12359). The default `936619743392459` is the web-app id; web-app
+  sessions from a datacenter range look maximally suspicious to IG. The
+  iOS-app id routes requests to a different IG endpoint cluster with a
+  different rate profile.
+- `--user-agent Instagram 339.0.0.12.95 (iPhone16,1; iOS 18_2; ...)` —
+  matches the iOS app id above. A mismatched UA + app_id pair is itself
+  a flag signal. Refresh the version annually to avoid looking like a
+  stale client.
+- `--retries 1`, `--fragment-retries 1` — overrides Layer 1's
+  `--retries 3 / --fragment-retries 3` for IG only. IG escalates flags
+  after 429-retry storms (especially fragment retries where one bad
+  fragment × 3 retries × N fragments multiplies the rate-limit signal).
+  Better to fail fast and let the cookies fallback / cooldown handle
+  recovery.
+
+Non-IG URLs (YouTube, Twitter, TikTok, etc.) keep the desktop Firefox UA
+and `--retries 3` from Layer 1; `igExtractorArgs` returns `nil` for them.
+
+**Layer 1 — Per-invocation throttling (`throttleArgs` in `downloader.go`)**
+— passed to every yt-dlp call:
 
 - `--sleep-requests 2`, `--sleep-interval 2`, `--max-sleep-interval 5` — slow
   the request rate within a single yt-dlp invocation.
 - `--retries 3`, `--fragment-retries 3` — lowered from yt-dlp's default of 10
   to avoid retry storms after a rate-limit response (which trigger harder bans).
+  IG URLs further lower these to 1 via Layer 0.
 - `--socket-timeout 30` — bound a stuck request so it doesn't tie up the gate.
 - `--user-agent Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:150.0) Gecko/20100101 Firefox/150.0`
-  — matches the desktop Firefox browser where cookies are exported. yt-dlp's
-  default UA is stale Chrome 95 — a flag on its own AND a mismatch with
-  Firefox-harvested cookies.
+  — desktop Firefox UA used as the default. yt-dlp's default UA is stale
+  Chrome 95 — a flag on its own AND a mismatch with Firefox-harvested cookies.
+  IG URLs override this with the iOS-app UA via Layer 0.
 
-> **Invariant:** the UA pinned in `throttleArgs` MUST match the browser used
-> to export the cookies file. Cookie+UA mismatch is itself a flag. When you
-> upgrade the browser used to harvest cookies, update the UA string in lockstep.
+> **Invariant:** the desktop UA pinned in `throttleArgs` MUST match the
+> browser used to export the cookies file (cookies are still used as a
+> fallback on the IG retry — see "Cookies for authenticated downloads"
+> above). Cookie+UA mismatch is itself a flag. When you upgrade the
+> browser used to harvest cookies, update the UA string in lockstep.
 
-**Process-wide rate limiter (`waitForIGSlot` in `downloader.go`)** — Instagram
-flags concurrent bursts hardest, so a process-wide mutex enforces a minimum
-gap between IG-bound yt-dlp invocations across all goroutines:
+**Layer 2 — Single-post short-circuit (`engine.IsPlaylist` →
+`downloader.IsInstagramSinglePost`)** — the engine's playlist-or-single-video
+preflight is skipped entirely for IG URLs matching `/reel/<id>` or `/tv/<id>`
+(path regex against the parsed URL). These URLs are syntactically guaranteed
+to be single videos, so calling `GetPlaylistInfo` would double the
+IG-extractor signal for the common case (every pasted reel would generate
+one metadata request followed by one download request) and accelerate
+account flagging. `/p/<id>` is intentionally EXCLUDED from the short-circuit
+because Instagram serves both single posts and carousel/sidecar posts
+(multiple media items) under `/p/`; treating all `/p/` as single-video would
+force the `--no-playlist` download path and silently drop every carousel
+item past the first. For `/p/`, `/explore/`, `/saved/`, `/stories/...`,
+profile URLs, and anything that doesn't match the regex, the preflight runs
+as before. Host match uses the same `isInstagramHost` predicate as
+`waitForIGSlot` (exact `instagram.com` or `*.instagram.com` suffix, so
+`evilinstagram.com` is excluded).
 
-- `minIGGap = 8 * time.Second` — the gap. Tune up if flagging persists, down
-  if users complain about latency.
+**Layer 3 — Process-wide rate limiter with cooldown (`waitForIGSlot`,
+`noteIGRateLimit` in `downloader.go`)** — Instagram flags concurrent bursts
+hardest, so a process-wide mutex enforces a minimum gap AND honors a
+cooldown after rate-limit responses:
+
+- `minIGGap = 15 * time.Second` — the steady-state gap between IG-bound
+  yt-dlp invocations. Production logs showed flagging after ~8 successes
+  per 46s (~10 req/min); 15s spacing gives ~8 successes per 105s
+  (~4.6 req/min), roughly 50% headroom under the observed flag rate.
+  Tune up if flagging persists, down if users complain about latency.
+- `igCooldown = 5 * time.Minute` — the global pause applied to IG-bound
+  yt-dlp invocations after yt-dlp returns an IG rate-limit / login-required
+  error. Set via `noteIGRateLimit`, which writes `igCooldownUntil = now + igCooldown`.
+  Consecutive rate-limit responses slide the deadline forward (don't extend
+  it) so the bot keeps quiet rather than resuming exactly 5 minutes after
+  the first flag. `noteIGRateLimit` fires from `runWithCookieFallback`
+  whenever the final returned error is IG-rate-limit-shaped — anonymous
+  attempt and cookies retry both feed into the same cooldown.
+- `waitForIGSlot` waits whichever is longer: the remaining `minIGGap`
+  spacing, or the remaining `igCooldownUntil` deadline. Both are read
+  under `igMu`. On wake, `igLastAt` is stamped to the projected wake time
+  inside the lock so concurrent callers queue `minIGGap` further out (and
+  retry storms after ctx cancellation still respect the gap).
 - Host match uses `Hostname() == "instagram.com" || strings.HasSuffix(host, ".instagram.com")`
   (exact or suffix-with-dot — catches `www`/`m.instagram.com`, excludes
   confusables like `evilinstagram.com`).
-- The gate stamps `igLastAt` to the projected wake time inside the lock
-  BEFORE sleeping, so concurrent callers queue minIGGap further out and
-  retry storms after ctx cancellation still respect the gap.
 - The callback is invoked outside the lock so a slow Telegram edit by one
   user doesn't block other goroutines waiting for the slot.
 - Gated call sites: `DownloadWithProgress` (single video) and
   `DownloadPlaylistVideo` (per item). `GetPlaylistInfo` is NOT gated — it
-  always precedes the actual download (which IS gated), and gating both
-  would double-charge every IG URL.
+  usually precedes the actual download (which IS gated), and gating both
+  would double-charge every IG URL. Note: the Layer 2 short-circuit
+  (`engine.IsPlaylist` → `IsInstagramSinglePost`) skips `GetPlaylistInfo`
+  entirely for canonical IG single-video URLs (`/reel/`, `/tv/`; `/p/` is
+  excluded because it may be a carousel), so in practice `GetPlaylistInfo`
+  only runs for non-IG hosts, IG `/p/` URLs (single posts and carousels),
+  and IG profile/explore/saved/etc. paths.
 
 **`queued` progress phase** — when the gate has to wait, a single
 `Progress{Phase: "queued", ETA: <remaining>}` event is emitted via the
 callback before the sleep. Bot UI renders `Waiting for Instagram rate limit
-(~7s)...`; HTTP API streams `{"status":"queued","eta":"7s"}` as an NDJSON line.
+(~14s)...` (or `~4m30s...` during a cooldown); HTTP API streams
+`{"status":"queued","eta":"14s"}` as an NDJSON line.

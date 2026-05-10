@@ -8,7 +8,7 @@ Four changes, in priority order:
 
 0. **IG-specific extractor args: switch to iOS-app fingerprint** for Instagram URLs only. The default `X-IG-App-ID` is the **web app id** (`936619743392459`); web-app sessions originating from a Hetzner datacenter range look maximally suspicious to IG. The iOS app id (`124024574287414`, surfaced via `--extractor-args "instagram:app_id=..."` per yt-dlp PR #12359) shifts the request to a different IG endpoint cluster with a different rate profile. Pair with an iOS-app `--user-agent` (UA must match the app_id or it's worse than the default). Also drop `--retries` AND `--fragment-retries` from 3 → 1 for IG: IG escalates flags after 429-retry storms, so retrying after a rate-limit response actively harms us — fragment retries are the worse case (one bad fragment × 3 retries × N fragments multiplies rate-limit signal). Bump `minIGGap` from 8s → 15s — the observed flag point was ~8 successes per 46s (~10 req/min); 15s spacing gives ~50% headroom under that observed rate (8 successes in 105s, ~4.6 req/min) at negligible UX cost.
 1. **Try-without-cookies-first** for download paths. Most Instagram posts are public and don't need auth. Bot tries anonymous first; only on `login required` errors retries with `--cookies`. Cookies become a fallback, not the default — account stays clean for the majority of traffic.
-2. **Skip `IsPlaylist` for known single-URL patterns.** Currently every `/reel/`, `/p/`, `/tv/` URL generates two yt-dlp Instagram extractions: one for `IsPlaylist`/`GetPlaylistInfo`, then one for the actual download. That's 2× the IG signal for single-video URLs. URL-pattern check eliminates the preflight for the common case.
+2. **Skip `IsPlaylist` for known single-URL patterns.** Currently every `/reel/`, `/tv/` URL generates two yt-dlp Instagram extractions: one for `IsPlaylist`/`GetPlaylistInfo`, then one for the actual download. That's 2× the IG signal for single-video URLs. URL-pattern check eliminates the preflight for the common case. (`/p/` excluded — see Layer 2 notes below: those URLs can be carousels with multiple media items, so they must keep going through `GetPlaylistInfo` to avoid silently dropping items past the first.)
 3. **Cooldown on first IG rate-limit response.** When yt-dlp returns `Requested content is not available, rate-limit reached or login required`, the bot should back off (e.g. 5 minutes) instead of continuing to hammer with the next user's URL. Currently the bot just keeps trying every 8s, digging the account deeper.
 
 These four together substantially reduce account exposure without proxy or warmup. Per codex/external-research consultation, this is the only high-confidence lever set left given the operator's constraints. **`--impersonate` / curl_cffi is explicitly out of scope** — research confirmed the IG extractor doesn't go through endpoints where TLS fingerprint gating applies.
@@ -41,7 +41,7 @@ These four together substantially reduce account exposure without proxy or warmu
 ## Testing Strategy
 
 - **unit tests**:
-  - URL classification helper (`isInstagramSinglePost` or similar) — table-driven, covers `/p/`, `/reel/`, `/tv/` (true), `/u/`, root, `/explore/` (false), non-IG URLs (false), URLs with query strings, malformed URLs.
+  - URL classification helper (`isInstagramSinglePost` or similar) — table-driven, covers `/reel/`, `/tv/` (true), `/p/` (false — may be carousel; see Layer 2), `/u/`, root, `/explore/` (false), non-IG URLs (false), URLs with query strings, malformed URLs.
   - Rate-limit detection helper (`isIGRateLimit(err)`) — table-driven with the actual IG error strings observed in production logs.
   - Cooldown behavior in `waitForIGSlot` — after `noteIGRateLimit()` is called, subsequent IG callers wait the cooldown period (not just `minIGGap`).
 - **integration / wiring**: not unit-tested at the exec.Cmd boundary (consistent with cookies + throttle wiring trade-off). Verified by diff inspection at the three call sites.
@@ -80,9 +80,11 @@ Refactor each download method so the cookies path is a per-call parameter, not a
 
 **Layer 2 — skip IsPlaylist for known single-URL patterns:**
 
-In `engine.IsPlaylist` (or in the bot/API call sites — pick the layer): pre-classify the URL. If it matches `/p/`, `/reel/`, `/tv/` on `instagram.com`, return `(false, nil, nil)` immediately without calling `GetPlaylistInfo`. No yt-dlp call, no IG hit.
+In `engine.IsPlaylist` (or in the bot/API call sites — pick the layer): pre-classify the URL. If it matches `/reel/` or `/tv/` on `instagram.com`, return `(false, nil, nil)` immediately without calling `GetPlaylistInfo`. No yt-dlp call, no IG hit.
 
-The check is purely syntactic — no network. For non-Instagram URLs and Instagram URLs that DON'T match the single-post pattern (e.g. `/explore/`, `/<username>/saved/`), fall through to the existing `GetPlaylistInfo` call.
+`/p/<id>` is intentionally EXCLUDED from the short-circuit: Instagram serves both single posts and carousel/sidecar posts (multiple media items) under `/p/`. Treating all `/p/` as single-video would force the `--no-playlist` download path and silently drop every carousel item past the first. `/p/` URLs continue going through `GetPlaylistInfo` so `ProcessPlaylist` can extract the full carousel. The small extra metadata fetch for single `/p/` posts is the cost of correctness — `/reel/` and `/tv/` are unambiguously single-video and remain short-circuited.
+
+The check is purely syntactic — no network. For non-Instagram URLs and Instagram URLs that DON'T match the single-post pattern (e.g. `/p/`, `/explore/`, `/<username>/saved/`), fall through to the existing `GetPlaylistInfo` call.
 
 **Layer 3 — cooldown on first IG rate-limit:**
 
@@ -167,8 +169,8 @@ func (e *Engine) IsPlaylist(ctx, url) (bool, *PlaylistInfo, error) {
 URL classifier `isInstagramSinglePost(url string) bool` lives in `downloader.go` (same package as `waitForIGSlot`'s host parser) and is called from engine. Pattern (Go regex on parsed Path):
 
 ```go
-// instagram.com/{p|reel|tv}/<id>/...
-var igSinglePostRe = regexp.MustCompile(`^/(p|reel|tv)/[^/]+/?`)
+// instagram.com/{reel|tv}/<id>/...  — /p/ excluded (may be a carousel)
+var igSinglePostRe = regexp.MustCompile(`^/(reel|tv)/[^/]+/?`)
 
 func isInstagramSinglePost(rawURL string) bool {
     u, err := url.Parse(rawURL)
@@ -224,9 +226,9 @@ return result, err
 - Modify: `internal/downloader/downloader.go`
 - Modify: `internal/downloader/downloader_test.go`
 
-- [x] add `isInstagramSinglePost(rawURL string) bool` to `downloader.go` near `waitForIGSlot`. Parses URL, host-matches IG (same pattern as gate), then path-matches `^/(p|reel|tv)/[^/]+/?`. Returns false on parse error or non-IG host.
+- [x] add `isInstagramSinglePost(rawURL string) bool` to `downloader.go` near `waitForIGSlot`. Parses URL, host-matches IG (same pattern as gate), then path-matches `^/(reel|tv)/[^/]+/?` (`/p/` excluded — see Layer 2 notes; carousel posts must keep going through GetPlaylistInfo). Returns false on parse error or non-IG host.
 - [x] add `isIGRateLimit(err error) bool` to `downloader.go`. Walks the wrapped error chain (errors.Unwrap or string-search the formatted message), returns true if any of `"rate-limit reached or login required"`, `"HTTP Error 429"`, or `"login required"` substrings present.
-- [x] add `TestIsInstagramSinglePost` table-driven: positive cases (`/p/abc/`, `/reel/xyz`, `/tv/123/`, `https://www.instagram.com/p/abc/`, with query string `?igsh=...`); negative (`instagram.com/`, `/explore/`, `/u/name/saved/`, `/stories/...`, non-IG hosts); edge (parse error returns false; `evilinstagram.com/p/abc/` returns false — host mismatch).
+- [x] add `TestIsInstagramSinglePost` table-driven: positive cases (`/reel/xyz`, `/tv/123/`, `https://www.instagram.com/reel/xyz/`, with query string `?utm_source=...`); negative (`/p/abc/` — may be carousel; `instagram.com/`, `/explore/`, `/u/name/saved/`, `/stories/...`, non-IG hosts); edge (parse error returns false; `evilinstagram.com/reel/abc/` returns false — host mismatch).
 - [x] add `TestIsIGRateLimit` table-driven: positive (the three exact production strings), negative (random go errors, nil error returns false, generic exit-status-1 error), edge (wrapped errors via `fmt.Errorf("...: %w", inner)`).
 - [x] run `make test` — must pass before Task 2.
 - [x] run `go vet ./... && go build ./...`.
@@ -306,7 +308,7 @@ return result, err
   - `igExtractorArgs(url)` is appended at all three yt-dlp invocation sites and overrides UA / retries for IG only.
   - `minIGGap = 15 * time.Second` (was 8s — Task 2 spec; bumped to 15s per the rationale in lines 99-102 of downloader.go, NOT 12s as the original Task 6 wording suggested).
   - `DownloadWithProgress` and `DownloadPlaylistVideo` call yt-dlp ANONYMOUSLY first; only retry with cookies on `isIGRateLimit(err)`.
-  - `GetPlaylistInfo` is NOT called by `IsPlaylist` for `/p/`, `/reel/`, `/tv/` IG URLs.
+  - `GetPlaylistInfo` is NOT called by `IsPlaylist` for `/reel/`, `/tv/` IG URLs. (`/p/` is excluded from the short-circuit because of the carousel case — it still goes through `GetPlaylistInfo` so `ProcessPlaylist` can extract carousel media.)
   - `noteIGRateLimit()` is called on every IG rate-limit error path.
   - `waitForIGSlot` honors `igCooldownUntil` in addition to `minIGGap`.
 - [x] confirm no regression for non-IG URLs (YouTube, Twitter, etc.):
@@ -315,7 +317,7 @@ return result, err
 
 ### Task 7: Move plan to completed
 
-- [ ] move this plan to `docs/plans/completed/20260511-ig-reduce-account-exposure.md`.
+- [x] move this plan to `docs/plans/completed/20260511-ig-reduce-account-exposure.md`.
 
 ## Post-Completion
 

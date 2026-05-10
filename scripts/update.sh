@@ -34,7 +34,10 @@ trap 'ssh "$SSH_HOST" "rm -f $TMP_BIN" 2>/dev/null || true' EXIT
 scp bin/sushe "$SSH_HOST:$TMP_BIN"
 
 echo "Pre-flight check..."
-ssh "$SSH_HOST" "test -x /home/$REMOTE_USER/sushe/bin/telegram-bot-api" \
+# Use sudo so the check works regardless of whether the SSH user can
+# traverse /home/$REMOTE_USER/ (mode 700 by default; admin SSH user
+# typically isn't in the service-user group).
+ssh "$SSH_HOST" "sudo test -x /home/$REMOTE_USER/sushe/bin/telegram-bot-api" \
     || { echo "ERROR: telegram-bot-api binary missing on server! Run 'make deploy' to restore it."; exit 1; }
 
 echo "Installing binary and restarting..."

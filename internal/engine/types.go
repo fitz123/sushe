@@ -7,9 +7,9 @@ import (
 )
 
 // ProgressCallback is called with progress updates during processing.
-// phase: "downloading", "encoding", "merging", "splitting"
-// percent: 0-100
-// detail: optional extra info (codec name, speed, etc.)
+// phase: "queued", "downloading", "encoding", "merging", "splitting"
+// percent: 0-100 (zero for "queued"; the wait duration is conveyed via detail)
+// detail: optional extra info (codec name, speed, queued ETA, etc.)
 type ProgressCallback func(phase string, percent float64, detail string)
 
 // PartResult describes a single split video part.
@@ -53,6 +53,9 @@ func adaptProgressCb(cb ProgressCallback) downloader.ProgressCallback {
 			}
 		case "splitting":
 			detail = fmt.Sprintf("part %d/%d", p.PartNum, p.TotalParts)
+		case "queued":
+			// Forward ETA so the bot/API caller can render the wait duration.
+			detail = p.ETA
 		}
 		cb(p.Phase, p.Percent, detail)
 	}

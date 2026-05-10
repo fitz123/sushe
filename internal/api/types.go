@@ -18,6 +18,9 @@ type ProgressEvent struct {
 	Codec   string  `json:"codec,omitempty"`
 	Video   int     `json:"video,omitempty"`
 	URL     string  `json:"url,omitempty"`
+	// ETA conveys the remaining wait duration when Status == "queued"
+	// (Instagram rate-limit gate). Format is Go duration string (e.g. "7s").
+	ETA string `json:"eta,omitempty"`
 }
 
 // ResultEvent is the final NDJSON line indicating success or failure.

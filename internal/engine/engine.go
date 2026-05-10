@@ -87,7 +87,20 @@ func (e *Engine) ProcessPlaylist(ctx context.Context, url string, progressCb fun
 	for i, entry := range info.Entries {
 		videoNum := i + 1
 
-		// Per-video progress adapter
+		// Per-video progress adapter.
+		//
+		// KNOWN LIMITATION: this callback signature carries only (videoNum,
+		// total, phase, percent) — Progress.ETA and Progress.Detail are
+		// dropped. For Instagram playlist items hitting the rate-limit gate,
+		// the bot UI shows "Queued..." without an ETA, and the HTTP API
+		// emits {"status":"queued"} without the documented `eta` field.
+		// The single-video path (Engine.Process) carries ETA correctly.
+		//
+		// TODO: extend the playlist progress callback contract to forward
+		// the full downloader.Progress struct (or at least detail+eta) so
+		// API clients and bot UI see queued-wait ETAs on playlist items.
+		// Acknowledged trade-off from phase-1 review; codex external review
+		// 2026-05-10 re-flagged it for the API path specifically.
 		var dlCb downloader.ProgressCallback
 		if progressCb != nil {
 			dlCb = func(p downloader.Progress) {

@@ -175,11 +175,12 @@ func (bs *BotService) processURL(c tele.Context, url string) error {
 		defer mu.Unlock()
 
 		now := time.Now()
-		// "queued" fires at most once per gated invocation and carries the
-		// only signal the user has that the bot isn't stalled. Bypass the
-		// rate-limit early-return so a fresh request right after a previous
-		// download (lastPercent=100, percent=0, <2s elapsed) still shows
-		// "Waiting for Instagram rate limit..." instead of silently waiting.
+		// Bypass the rate-limit check for queued (fires once per call before
+		// any download progress, so we want the user to see it immediately
+		// even if it follows another phase event in flight). lastUpdate /
+		// lastPercent are local to this single call so a previous download
+		// can't affect them — this bypass is a cheap defensive guarantee that
+		// the only "I'm waiting on IG" UI signal is never suppressed.
 		if phase != "queued" && now.Sub(lastUpdate) < minUpdateInterval && percent < 100 {
 			if percent-lastPercent < 5 {
 				return

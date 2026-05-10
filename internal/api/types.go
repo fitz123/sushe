@@ -20,6 +20,9 @@ type ProgressEvent struct {
 	URL     string  `json:"url,omitempty"`
 	// ETA conveys the remaining wait duration when Status == "queued"
 	// (Instagram rate-limit gate). Format is Go duration string (e.g. "7s").
+	// Set when Status == "queued" for single-video downloads; absent for
+	// playlist queued events (TODO: extend playlist callback to carry
+	// detail/ETA so the field is populated consistently across paths).
 	ETA string `json:"eta,omitempty"`
 }
 

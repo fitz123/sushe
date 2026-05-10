@@ -138,7 +138,10 @@ bestvideo[height<=1080]+bestaudio/best
 
 The `queued` event appears only for Instagram URLs when the process-wide rate
 limiter delays the download (see "Instagram rate limiting" below). `eta` is a
-Go duration string (e.g. `"7s"`).
+Go duration string (e.g. `"7s"`) and is present for single-video downloads;
+playlist queued events currently omit `eta` because the playlist progress
+callback does not carry detail through (tracked as a TODO in
+`internal/api/types.go`).
 
 **Errors:**
 - `401` — missing or invalid bearer token

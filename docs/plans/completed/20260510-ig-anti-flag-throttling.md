@@ -1,5 +1,39 @@
 # Instagram Anti-Flag Throttling
 
+## Deviations from original plan (read first)
+
+This file is the historic plan, but the as-shipped design differs from the
+original in two material ways. Phase-1 review applied both fixes after
+discovering issues during implementation. Future readers should treat the
+descriptions below — not the original prose this section replaces — as ground
+truth for what the code actually does.
+
+1. **`waitForIGSlot` lock discipline (lock → stamp → unlock → sleep).** The
+   original plan put the sleep INSIDE the critical section. The as-shipped
+   design holds `igMu` only long enough to read+stamp `igLastAt` to the
+   projected wake time (`time.Now().Add(remaining)`), then releases the lock
+   and sleeps outside. progressCb is also called outside the lock. Rationale:
+   stamping to the projected wake time inside the lock makes concurrent
+   callers queue themselves `minIGGap` further out (instead of all racing to
+   the same `now+remaining` once they reacquire), and moving the sleep +
+   progressCb out of the critical section means a slow Telegram edit can't
+   block other goroutines from observing the projected next-slot time.
+
+2. **Gate placement (single-video gated, playlist info NOT gated, playlist
+   items gated).** The original plan gated both `DownloadWithProgress` and
+   `GetPlaylistInfo`. Review found that gating `GetPlaylistInfo` charged
+   single-URL IG calls the gap twice (once for `IsPlaylist` discovery, again
+   for the download itself). The as-shipped design:
+   - `DownloadWithProgress` — gated (the user-burst path the gate primarily
+     defends against).
+   - `GetPlaylistInfo` — NOT gated (metadata-only `--flat-playlist --dump-json`
+     fetch, single short request, doesn't fit the burst pattern IG flags).
+   - `DownloadPlaylistVideo` — gated per item (one gate-wait per item inside
+     the sequential `engine.ProcessPlaylist` loop).
+
+The remainder of this document has been edited in-place to reflect the
+as-shipped behavior; nothing below intentionally contradicts this section.
+
 ## Overview
 
 Reduces the bot's automation footprint against Instagram so cookies sessions last longer than a few days before Instagram triggers its "We suspect automated behavior" challenge. Two layers of defense:
@@ -65,7 +99,7 @@ Two pieces, both inside `internal/downloader/downloader.go`:
    ```
    Free function (not method) so the helper has no hidden state and is trivially testable.
 
-2. **`(d *Downloader) waitForIGSlot(ctx context.Context, rawURL string, progressCb ProgressCallback) error` (method, mutex-guarded, context-aware)** — checks if the URL host matches `instagram.com`; if so, locks `d.igMu`, computes remaining wait time, emits ONE `Progress{Phase: "queued", ETA: remaining}` event via `progressCb` IF a wait is actually needed (so non-IG URLs and warmed-up callers don't see spurious "queued" UI), waits until `time.Since(d.igLastAt) >= minIGGap` OR ctx is cancelled, updates `d.igLastAt`, returns nil. For non-IG URLs returns nil immediately without taking the lock. On ctx cancellation, returns `ctx.Err()` so the caller propagates the cancellation up. `minIGGap` is a package-level `const` (8 seconds) — hardcoded per user preference.
+2. **`(d *Downloader) waitForIGSlot(ctx context.Context, rawURL string, progressCb ProgressCallback) error` (method, mutex-guarded, context-aware)** — checks if the URL host matches `instagram.com`; if so, briefly enters `d.igMu` to compute `remaining := minIGGap - time.Since(d.igLastAt)` and stamp `d.igLastAt = time.Now().Add(remaining)` (the projected wake time) when `remaining > 0`, then EXITS the lock. Outside the lock, if a wait is needed, emits ONE `Progress{Phase: "queued", ETA: remaining}` event via `progressCb` (when non-nil) and waits via `select { case <-time.After(remaining): case <-ctx.Done(): return ctx.Err() }`. For non-IG URLs returns nil immediately without taking the lock. On ctx cancellation, returns `ctx.Err()` so the caller propagates the cancellation up; the stamp set inside the lock is preserved across cancellation, preventing retry storms from bypassing the gap. `minIGGap` is a package-level `const` (8 seconds) — hardcoded per user preference.
 
 Host extraction: parse with `net/url.Parse`, then exact-or-suffix-with-dot check on the parsed `Hostname()`:
 ```go
@@ -109,12 +143,19 @@ Why the inversion is safe:
 - `igLastAt` is `time.Time` (zero value means "never seen IG before").
 
 **`(d *Downloader) waitForIGSlot(ctx context.Context, rawURL string, progressCb ProgressCallback) error`**:
+- Cheap early-out on already-cancelled context (`ctx.Err()` non-nil) before any parsing or locking.
 - Parses URL via `net/url.Parse`. On parse error, returns nil silently (URL is malformed; let yt-dlp report the error downstream — don't double-report).
 - Host match: `host := strings.ToLower(u.Hostname()); isIG := host == "instagram.com" || strings.HasSuffix(host, ".instagram.com")`. Catches `instagram.com`, `www.instagram.com`, `m.instagram.com`. Excludes `evilinstagram.com`, `notinstagram.com`, `instagram.com.evil.com` (Hostname() strips port, the leading-dot suffix guards against confusables).
-- Lock acquisition order: `d.igMu.Lock()` → defer `d.igMu.Unlock()` → compute `remaining := minIGGap - time.Since(d.igLastAt)` → if `remaining > 0`: emit `progressCb(Progress{Phase: "queued", ETA: remaining.Round(time.Second).String()})` if progressCb != nil → wait via `select { case <-time.After(remaining): case <-ctx.Done(): return ctx.Err() }` → set `d.igLastAt = time.Now()` → return nil. If `remaining <= 0`: skip both progress emit and sleep (no UI churn for warmed-up callers).
-- Sleep happens INSIDE the lock so concurrent callers serialize. With a 4-URL burst and 8s gap, the 4th caller waits ~24s — acceptable since serving slowly is much better than getting flagged. On ctx cancellation the lock is released immediately (defer) so the next waiter unblocks faster than its full quota.
-- `igLastAt` is updated even when yt-dlp ultimately fails after the gate releases. Intentional: prevents a retry stampede where N quick failures ignore the limit.
-- The "queued" Progress event is emitted EXACTLY ONCE per call (not periodically). For the typical 8-24s wait, a single message edit is enough — the Telegram message stays on "Waiting for Instagram rate limit..." until yt-dlp starts producing real download progress.
+- Lock/sleep ordering (as shipped — see "Deviations from original plan"):
+  1. `d.igMu.Lock()` — narrow critical section, no I/O.
+  2. Compute `remaining := minIGGap - time.Since(d.igLastAt)`.
+  3. If `remaining > 0`: stamp `d.igLastAt = time.Now().Add(remaining)` (the PROJECTED wake time, so the next waiter sees "next slot opens at now+remaining" and queues `minIGGap` further out). Else: stamp `d.igLastAt = time.Now()`.
+  4. `d.igMu.Unlock()` — exit the lock BEFORE sleeping or invoking progressCb.
+  5. If `remaining > 0`: invoke `progressCb(Progress{Phase: "queued", ETA: remaining.Round(time.Second).String()})` (when progressCb != nil), then `select { case <-time.After(remaining): case <-ctx.Done(): return ctx.Err() }`.
+  6. Return nil.
+- Why the projected-wake-time stamp inside the lock (instead of stamping `time.Now()` after the sleep): it lets concurrent callers serialize correctly via a narrow lock. Each new caller sees the most recent projected wake time, computes its own remaining wait off that, and stamps its OWN projected wake time. The actual sleeps then overlap with `progressCb` and other work outside the lock, but the spacing invariant is preserved by the stamps. With a 4-URL burst and 8s gap, the 4th caller waits ~24s — acceptable since serving slowly is much better than getting flagged.
+- `igLastAt` is updated unconditionally (even on ctx cancellation, since the stamp happens before the sleep). Intentional: prevents a retry stampede where N quick cancellations or failures bypass the limit.
+- The "queued" Progress event is emitted EXACTLY ONCE per call (not periodically), and only when an actual wait is needed AND progressCb is non-nil. For the typical 8-24s wait, a single message edit is enough — the Telegram message stays on "Waiting for Instagram rate limit..." until yt-dlp starts producing real download progress.
 
 **Constant**:
 ```go
@@ -152,8 +193,11 @@ const minIGGap = 8 * time.Second
 
 - [x] add `igMu sync.Mutex` and `igLastAt time.Time` fields to the `Downloader` struct.
 - [x] add package-level constant `const minIGGap = 8 * time.Second` near other constants (`MaxFileSize`, `MaxUploadSize`, etc.).
-- [x] add unexported method `(d *Downloader) waitForIGSlot(ctx context.Context, rawURL string, progressCb ProgressCallback) error` that parses URL, host-matches `instagram.com` via `host == "instagram.com" || strings.HasSuffix(host, ".instagram.com")` (note the leading dot — guards against `evilinstagram.com`), and under `d.igMu`: computes `remaining`, if `remaining > 0` emits `progressCb(Progress{Phase: "queued", ETA: remaining.Round(time.Second).String()})` (when progressCb != nil) then waits via `select { case <-time.After(remaining): case <-ctx.Done(): return ctx.Err() }`, finally updates `d.igLastAt`. Returns nil for non-IG URLs and parse errors. Skip progress emit and sleep entirely if `remaining <= 0` (no spurious UI churn for warmed-up callers).
-- [x] call `if err := d.waitForIGSlot(ctx, url, progressCb); err != nil { return nil, err }` as the first line of `DownloadWithProgress`. In `GetPlaylistInfo` (no progress callback in scope), call with `nil`: `if err := d.waitForIGSlot(ctx, url, nil); err != nil { return nil, err }`. Do NOT call from `DownloadPlaylistVideo` (see "Playlist double-gating avoidance" in Solution Overview). Place before building args, before creating the work directory.
+- [x] add unexported method `(d *Downloader) waitForIGSlot(ctx context.Context, rawURL string, progressCb ProgressCallback) error` that parses URL, host-matches `instagram.com` via `host == "instagram.com" || strings.HasSuffix(host, ".instagram.com")` (note the leading dot — guards against `evilinstagram.com`), then:
+  - Enter `d.igMu`, compute `remaining := minIGGap - time.Since(d.igLastAt)`, stamp `d.igLastAt = time.Now().Add(remaining)` if `remaining > 0` else `d.igLastAt = time.Now()`, exit `d.igMu`.
+  - Outside the lock, if `remaining > 0`: emit `progressCb(Progress{Phase: "queued", ETA: remaining.Round(time.Second).String()})` (when progressCb != nil) and wait via `select { case <-time.After(remaining): case <-ctx.Done(): return ctx.Err() }`.
+  - Returns nil for non-IG URLs and parse errors. Skip progress emit and sleep entirely if `remaining <= 0` (no spurious UI churn for warmed-up callers).
+- [x] call `if err := d.waitForIGSlot(ctx, url, progressCb); err != nil { return nil, err }` as the first line of `DownloadWithProgress`. ALSO call from `DownloadPlaylistVideo` (one gate-wait per item inside `engine.ProcessPlaylist`'s sequential loop). Do NOT call from `GetPlaylistInfo` (see "Playlist double-gating avoidance" in Solution Overview — gating metadata charges single-URL IG flows the gap twice). Place before building args, before creating the work directory.
 - [x] add `TestWaitForIGSlot` to `downloader_test.go` with table-driven cases:
   - non-IG URL (youtube.com/watch?...) — expect elapsed < 100ms, igLastAt unchanged.
   - IG URL with zero `igLastAt` (initial call) — expect elapsed < 100ms, igLastAt updated to ~now.
@@ -196,9 +240,9 @@ const minIGGap = 8 * time.Second
 - [x] `go vet ./...` clean, `go build ./...` clean.
 - [x] read the diff of `internal/downloader/downloader.go` and confirm:
   - `throttleArgs()` is prepended at all three `exec.CommandContext(ctx, "yt-dlp", ...)` sites (single video, playlist info, playlist video).
-  - `waitForIGSlot(ctx, url, progressCb)` is called as the first line of `DownloadWithProgress` (progressCb propagated). `waitForIGSlot(ctx, url, nil)` is called from `GetPlaylistInfo`. NOT called in `DownloadPlaylistVideo` (avoids 8s × N latency on playlists; see Solution Overview).
+  - `waitForIGSlot(ctx, url, progressCb)` is called as the first line of `DownloadWithProgress` (progressCb propagated) AND `DownloadPlaylistVideo` (progressCb propagated). NOT called in `GetPlaylistInfo` (avoids charging single-URL IG flows the gap twice via `IsPlaylist` discovery + download; see Solution Overview).
   - URL is the LAST element in every args slice.
-  - The `select { case <-time.After: case <-ctx.Done() }` pattern is used inside `waitForIGSlot`, NOT a bare `time.Sleep` (cancellation must propagate).
+  - The lock is held only for the read+stamp of `igLastAt`. The sleep (`select { case <-time.After: case <-ctx.Done() }`) and progressCb invocation happen OUTSIDE the lock. The stamp uses the PROJECTED wake time (`time.Now().Add(remaining)`) so concurrent callers queue minIGGap further out.
   - "queued" Progress emission is gated by `remaining > 0 && progressCb != nil` so non-IG / warmed-up / no-callback paths don't churn.
 - [x] confirm `Downloader` struct has `igMu sync.Mutex` and `igLastAt time.Time` fields.
 - [x] confirm `internal/bot/bot.go` has a `case "queued"` branch in the progress switch that renders "Waiting for Instagram rate limit..." (with ETA suffix when present).

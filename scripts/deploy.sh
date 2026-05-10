@@ -188,9 +188,9 @@ REMOTE
 # cleanly without cookies; SUSHE_COOKIES env var just produces a startup
 # warning if the file is unreadable).
 transfer_cookies() {
-    local local_cookies="$REPO_DIR/instagram-cookies.txt"
+    local local_cookies="$REPO_DIR/www.instagram.com_cookies.txt"
     if [[ ! -f "$local_cookies" ]]; then
-        warn "No instagram-cookies.txt in repo root — bot will start without cookies (Instagram downloads will fail with login_required until cookies are deployed via scripts/install-cookies.sh)"
+        warn "No www.instagram.com_cookies.txt in repo root — bot will start without cookies (Instagram downloads will fail with login_required until cookies are deployed via scripts/install-cookies.sh)"
         return 0
     fi
     log "Transferring cookies file..."

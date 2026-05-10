@@ -31,7 +31,8 @@ source "$REPO_DIR/.env"
 : "${SSH_HOST:?SSH_HOST not set in .env}"
 
 LOCAL_COOKIES="${1:-$REPO_DIR/www.instagram.com_cookies.txt}"
-REMOTE_COOKIES_PATH="/home/sushe/.config/sushe/cookies.txt"
+SERVICE_USER="${REMOTE_USER:-sushe}"
+REMOTE_COOKIES_PATH="/home/$SERVICE_USER/.config/sushe/cookies.txt"
 
 # Step 1: validate local cookies file
 if [[ ! -f "$LOCAL_COOKIES" ]]; then
@@ -40,11 +41,32 @@ if [[ ! -f "$LOCAL_COOKIES" ]]; then
 fi
 echo "==> Local cookies file: $LOCAL_COOKIES ($(wc -c <"$LOCAL_COOKIES") bytes)"
 
-# Step 2: upload cookies file (no sudo)
-echo "==> Step 2: upload cookies file"
-ssh "$SSH_HOST" "mkdir -p ~/.config/sushe && chmod 700 ~/.config/sushe"
-scp "$LOCAL_COOKIES" "$SSH_HOST:.config/sushe/cookies.txt"
-ssh "$SSH_HOST" "chmod 600 $REMOTE_COOKIES_PATH && ls -la $REMOTE_COOKIES_PATH"
+# Probe SSH login user. The script supports two modes:
+#   - SSH_HOST resolves to SERVICE_USER (the service account, narrow sudo):
+#     direct file ops in own home, no sudo for file work.
+#   - SSH_HOST resolves to a different (admin) account with unrestricted sudo:
+#     stage to /tmp then sudo install -o SERVICE_USER -m 0600 to absolute path.
+SSH_USER="$(ssh "$SSH_HOST" 'id -un')"
+
+# Step 2: upload cookies file
+echo "==> Step 2: upload cookies file (ssh user: $SSH_USER, service user: $SERVICE_USER)"
+if [[ "$SSH_USER" == "$SERVICE_USER" ]]; then
+    # Service-user mode: own home, no sudo needed for file work.
+    ssh "$SSH_HOST" "mkdir -p ~/.config/sushe && chmod 700 ~/.config/sushe"
+    scp "$LOCAL_COOKIES" "$SSH_HOST:.config/sushe/cookies.txt"
+    ssh "$SSH_HOST" "chmod 600 $REMOTE_COOKIES_PATH && ls -la $REMOTE_COOKIES_PATH"
+else
+    # Admin-user mode: stage + sudo install to service user's home.
+    TMP_REMOTE="$(ssh "$SSH_HOST" 'mktemp /tmp/sushe-cookies-XXXXXX')"
+    scp "$LOCAL_COOKIES" "$SSH_HOST:$TMP_REMOTE"
+    ssh "$SSH_HOST" bash -s <<REMOTE
+set -e
+trap 'rm -f $TMP_REMOTE' EXIT
+sudo install -d -o $SERVICE_USER -g $SERVICE_USER -m 0700 /home/$SERVICE_USER/.config/sushe
+sudo install -o $SERVICE_USER -g $SERVICE_USER -m 0600 $TMP_REMOTE $REMOTE_COOKIES_PATH
+sudo ls -la $REMOTE_COOKIES_PATH
+REMOTE
+fi
 
 # Step 3: pre-flight — verify the merged unit has both required directives
 # BEFORE we restart. We check:
@@ -97,14 +119,21 @@ echo "    OK — Environment has SUSHE_COOKIES, ReadWritePaths includes $COOKIES
 echo "==> Step 4: sudo systemctl restart sushe"
 ssh "$SSH_HOST" "sudo systemctl restart sushe"
 
-# Step 5: verify live process env (no sudo: service runs as sushe, so the
-# operator can read /proc/<MainPID>/environ for its own service)
+# Step 5: verify live process env. Reading /proc/<MainPID>/environ requires
+# either being the same user as the running process OR sudo. So:
+#   - SSH user IS service user: cat directly
+#   - SSH user is admin: prefix with sudo
 echo "==> Step 5: verify live process /proc/<MainPID>/environ contains SUSHE_COOKIES"
 sleep 1  # let systemd respawn the process so MainPID points at the new instance
-LIVE_ENV="$(ssh "$SSH_HOST" "PID=\$(systemctl show sushe -p MainPID --value); test \"\$PID\" != 0 && cat /proc/\$PID/environ | tr '\0' '\n' | grep '^SUSHE_COOKIES='" || true)"
+if [[ "$SSH_USER" == "$SERVICE_USER" ]]; then
+    READ_ENVIRON="cat"
+else
+    READ_ENVIRON="sudo cat"
+fi
+LIVE_ENV="$(ssh "$SSH_HOST" "PID=\$(systemctl show sushe -p MainPID --value); test \"\$PID\" != 0 && $READ_ENVIRON /proc/\$PID/environ | tr '\0' '\n' | grep '^SUSHE_COOKIES='" || true)"
 if [[ -z "$LIVE_ENV" ]]; then
     echo "ERROR: could not verify live process picked up SUSHE_COOKIES." >&2
-    echo "Possible causes: service failed to start, MainPID==0, or the process runs as a non-sushe user." >&2
+    echo "Possible causes: service failed to start, MainPID==0, or process runs as a different user." >&2
     echo "--- last 30 lines of journal ---" >&2
     ssh "$SSH_HOST" "sudo sushe-logs -n 30 --no-pager" >&2 || true
     exit 1

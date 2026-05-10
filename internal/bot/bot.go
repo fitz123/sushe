@@ -175,7 +175,13 @@ func (bs *BotService) processURL(c tele.Context, url string) error {
 		defer mu.Unlock()
 
 		now := time.Now()
-		if now.Sub(lastUpdate) < minUpdateInterval && percent < 100 {
+		// Bypass the rate-limit check for queued (fires once per call before
+		// any download progress, so we want the user to see it immediately
+		// even if it follows another phase event in flight). lastUpdate /
+		// lastPercent are local to this single call so a previous download
+		// can't affect them — this bypass is a cheap defensive guarantee that
+		// the only "I'm waiting on IG" UI signal is never suppressed.
+		if phase != "queued" && now.Sub(lastUpdate) < minUpdateInterval && percent < 100 {
 			if percent-lastPercent < 5 {
 				return
 			}
@@ -183,6 +189,12 @@ func (bs *BotService) processURL(c tele.Context, url string) error {
 
 		var statusText string
 		switch phase {
+		case "queued":
+			if detail != "" {
+				statusText = fmt.Sprintf("⏳ Waiting for Instagram rate limit (~%s)...", detail)
+			} else {
+				statusText = "⏳ Waiting for Instagram rate limit..."
+			}
 		case "downloading":
 			if detail != "" {
 				statusText = fmt.Sprintf("Downloading: %.0f%% | %s", percent, detail)
@@ -238,10 +250,16 @@ func (bs *BotService) processPlaylist(c tele.Context, playlistURL string, playli
 		return err
 	}
 
-	// Progress callback for playlist downloads
+	// Progress callback for playlist downloads. Note: the engine playlist
+	// adapter (ProcessPlaylist) drops the per-event detail string, so phases
+	// that carry detail (queued ETA, encoding codec) can only render the
+	// phase label here. Per-item IG rate-limit gating still fires — users
+	// will see "Waiting for Instagram rate limit..." between items.
 	progressCb := func(videoNum, totalVideos int, phase string, percent float64) {
 		var statusText string
 		switch phase {
+		case "queued":
+			statusText = fmt.Sprintf("Video %d/%d: Waiting for Instagram rate limit...", videoNum, totalVideos)
 		case "downloading":
 			statusText = fmt.Sprintf("Video %d/%d: Downloading %.0f%%", videoNum, totalVideos, percent)
 		case "encoding":

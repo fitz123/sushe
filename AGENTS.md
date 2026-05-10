@@ -128,12 +128,20 @@ bestvideo[height<=1080]+bestaudio/best
 **Response** (`Content-Type: application/x-ndjson`, streamed):
 ```
 {"status":"started","url":"..."}
+{"status":"queued","eta":"7s"}
 {"status":"downloading","percent":45.2}
 {"status":"encoding","percent":80.0,"codec":"vp9"}
 {"status":"splitting","part":1,"total":3}
 {"status":"uploading","part":1,"total":1}
 {"status":"done","ok":true,"title":"Video Title","message_id":789,"file_size":123456}
 ```
+
+The `queued` event appears only for Instagram URLs when the process-wide rate
+limiter delays the download (see "Instagram rate limiting" below). `eta` is a
+Go duration string (e.g. `"7s"`) and is present for single-video downloads;
+playlist queued events currently omit `eta` because the playlist progress
+callback does not carry detail through (tracked as a TODO in
+`internal/api/types.go`).
 
 **Errors:**
 - `401` — missing or invalid bearer token
@@ -234,10 +242,10 @@ Note: `SUSHE_COOKIES` is set on the server via a systemd drop-in (see "Cookies f
 
 ```go
 type Progress struct {
-    Phase       string   // "downloading", "merging", "encoding", "splitting", "uploading"
+    Phase       string   // "queued", "downloading", "merging", "encoding", "splitting", "uploading"
     Percent     float64
     Speed       string
-    ETA         string
+    ETA         string   // For "downloading": yt-dlp ETA. For "queued": remaining wait duration.
     Total       string
     Downloaded  string
     PartNum     int      // Current part (for splitting/uploading)
@@ -245,6 +253,10 @@ type Progress struct {
     Codec       string   // Original codec when encoding
 }
 ```
+
+The `"queued"` phase is emitted by the Instagram rate limiter (`waitForIGSlot`)
+when a download is delayed waiting for the inter-request gap to elapse. See
+"Instagram rate limiting" below.
 
 ## Common Tasks
 
@@ -394,3 +406,49 @@ The script uploads the local `www.instagram.com_cookies.txt` to `~/.config/sushe
 **Hygiene:** use a dedicated Instagram account for the bot (not your personal one) to avoid the main account being flagged for unusual access patterns.
 
 **Do NOT** put `SUSHE_COOKIES` in `.env` — it is server-side config written into the systemd unit by `scripts/deploy.sh`. `.env` is for local-machine deploy config only.
+
+### Instagram rate limiting
+
+Cookies alone are not enough — Instagram also flags bursty request patterns
+regardless of auth state. The bot adds two layers of anti-flag posture:
+
+**Per-invocation throttling (`throttleArgs` in `downloader.go`)** — passed to
+every yt-dlp call:
+
+- `--sleep-requests 2`, `--sleep-interval 2`, `--max-sleep-interval 5` — slow
+  the request rate within a single yt-dlp invocation.
+- `--retries 3`, `--fragment-retries 3` — lowered from yt-dlp's default of 10
+  to avoid retry storms after a rate-limit response (which trigger harder bans).
+- `--socket-timeout 30` — bound a stuck request so it doesn't tie up the gate.
+- `--user-agent Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:150.0) Gecko/20100101 Firefox/150.0`
+  — matches the desktop Firefox browser where cookies are exported. yt-dlp's
+  default UA is stale Chrome 95 — a flag on its own AND a mismatch with
+  Firefox-harvested cookies.
+
+> **Invariant:** the UA pinned in `throttleArgs` MUST match the browser used
+> to export the cookies file. Cookie+UA mismatch is itself a flag. When you
+> upgrade the browser used to harvest cookies, update the UA string in lockstep.
+
+**Process-wide rate limiter (`waitForIGSlot` in `downloader.go`)** — Instagram
+flags concurrent bursts hardest, so a process-wide mutex enforces a minimum
+gap between IG-bound yt-dlp invocations across all goroutines:
+
+- `minIGGap = 8 * time.Second` — the gap. Tune up if flagging persists, down
+  if users complain about latency.
+- Host match uses `Hostname() == "instagram.com" || strings.HasSuffix(host, ".instagram.com")`
+  (exact or suffix-with-dot — catches `www`/`m.instagram.com`, excludes
+  confusables like `evilinstagram.com`).
+- The gate stamps `igLastAt` to the projected wake time inside the lock
+  BEFORE sleeping, so concurrent callers queue minIGGap further out and
+  retry storms after ctx cancellation still respect the gap.
+- The callback is invoked outside the lock so a slow Telegram edit by one
+  user doesn't block other goroutines waiting for the slot.
+- Gated call sites: `DownloadWithProgress` (single video) and
+  `DownloadPlaylistVideo` (per item). `GetPlaylistInfo` is NOT gated — it
+  always precedes the actual download (which IS gated), and gating both
+  would double-charge every IG URL.
+
+**`queued` progress phase** — when the gate has to wait, a single
+`Progress{Phase: "queued", ETA: <remaining>}` event is emitted via the
+callback before the sleep. Bot UI renders `Waiting for Instagram rate limit
+(~7s)...`; HTTP API streams `{"status":"queued","eta":"7s"}` as an NDJSON line.

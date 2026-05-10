@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,9 +30,40 @@ func cookieArgs(path string) []string {
 	return []string{"--cookies", path}
 }
 
+// throttleArgs returns yt-dlp anti-flag throttling flags. Applied at every
+// yt-dlp invocation site. The values are tuned for Instagram's anti-automation
+// heuristics but harmless on other sites (yt-dlp ignores irrelevant flags).
+//
+//   - --sleep-requests 2: 2s gap between metadata/GraphQL requests within a
+//     single invocation. Instagram's primary flag signal is request burst rate.
+//   - --sleep-interval 2 / --max-sleep-interval 5: 2-5s random sleep between
+//     downloads (matters for playlists; ignored for single videos).
+//   - --retries 3 / --fragment-retries 3: lower than yt-dlp's default of 10.
+//     Retry storms after a rate-limit response trigger harder bans; better to
+//     fail fast and let the operator refresh cookies than to hammer the API.
+//   - --socket-timeout 30: bound network hangs so a stuck request doesn't tie
+//     up the IG rate-limit slot.
+//   - --user-agent "Mozilla/5.0 ... Firefox/150.0": matches the desktop Firefox
+//     browser where cookies were exported. yt-dlp's default UA is stale Chrome
+//     95 — both a flag (no real human uses 4yr-old Chrome) and a mismatch with
+//     cookies harvested from Firefox (cookie+UA mismatch is itself a flag).
+//
+// Returns a fresh slice each call so callers can safely append onto it.
+func throttleArgs() []string {
+	return []string{
+		"--sleep-requests", "2",
+		"--sleep-interval", "2",
+		"--max-sleep-interval", "5",
+		"--retries", "3",
+		"--fragment-retries", "3",
+		"--socket-timeout", "30",
+		"--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:150.0) Gecko/20100101 Firefox/150.0",
+	}
+}
+
 // Progress represents download progress information
 type Progress struct {
-	Phase      string  // "downloading", "processing", "merging", "encoding", "splitting", "uploading"
+	Phase      string  // "queued", "downloading", "processing", "merging", "encoding", "splitting", "uploading"
 	Percent    float64 // 0-100
 	Speed      string  // e.g., "2.50MiB/s"
 	ETA        string  // e.g., "00:30"
@@ -52,10 +84,19 @@ const (
 	MaxSplitSize   = 1700 * 1024 * 1024 // 1.7GB - split target with keyframe overshoot margin
 	DownloadDir    = "/tmp/sushe"
 	DefaultTimeout = 60 * time.Minute // Increased for long videos
-	
+
 	// Playlist limits
 	MaxPlaylistVideos = 50             // Maximum videos per playlist
 	MaxVideoDuration  = 2 * time.Hour  // Skip videos longer than 2 hours
+
+	// minIGGap is the minimum spacing between Instagram-bound yt-dlp invocations
+	// across all goroutines. yt-dlp's --sleep-interval only governs intervals
+	// within a single invocation; a bot serving multiple Telegram users can
+	// still fire N IG requests in 2 seconds when users paste URLs concurrently.
+	// Instagram flags such bursts hardest, so a process-wide mutex enforces
+	// this gap. 8s is a starting point — tune up if flagging persists, down
+	// if users complain about latency.
+	minIGGap = 8 * time.Second
 )
 
 // MediaInfo contains video metadata from ffprobe
@@ -109,6 +150,14 @@ type Downloader struct {
 	downloadDir string
 	timeout     time.Duration
 	cookiesPath string
+
+	// igMu guards igLastAt and serializes Instagram-bound yt-dlp invocations
+	// across all goroutines. See waitForIGSlot for the rationale.
+	igMu sync.Mutex
+	// igLastAt is the wall-clock time of the most recent Instagram-bound
+	// yt-dlp invocation. Zero value means "never seen IG before" — the
+	// first IG call passes through immediately.
+	igLastAt time.Time
 }
 
 // New creates a Downloader. If cookiesPath is non-empty, every yt-dlp invocation
@@ -159,6 +208,85 @@ func New(cookiesPath string) *Downloader {
 	}
 }
 
+// waitForIGSlot enforces a process-wide minimum gap (minIGGap) between
+// Instagram-bound yt-dlp invocations. For non-Instagram URLs (and unparseable
+// URLs) it returns nil immediately without acquiring the lock. For IG URLs,
+// it briefly locks d.igMu to read+stamp d.igLastAt with the projected wake
+// time, then releases the lock and sleeps. Stamping to the projected wake
+// time inside the lock — before sleeping — has two benefits:
+//
+//   - Concurrent callers waiting on igMu read the projected next-slot time
+//     and queue themselves minIGGap further out (rather than all racing to
+//     the same now+remaining).
+//   - On ctx cancellation the stamp is preserved, so retry storms after the
+//     gate releases still respect the gap (matches the doc invariant).
+//
+// progressCb is invoked OUTSIDE the lock so a slow Telegram edit by one
+// goroutine cannot block other goroutines waiting for an IG slot.
+//
+// Host matching uses Hostname() (port stripped) with an exact-or-suffix-with-dot
+// rule: `host == "instagram.com" || strings.HasSuffix(host, ".instagram.com")`.
+// This catches www/m.instagram.com while excluding confusables like
+// `evilinstagram.com` and substring-in-path/query false positives.
+//
+// A `Progress{Phase: "queued", ETA: <remaining>}` event is emitted via
+// progressCb EXACTLY ONCE per call, and only when an actual wait is needed
+// AND progressCb is non-nil. This keeps the bot UI quiet for non-IG URLs,
+// for warmed-up callers (gap already elapsed), and for callers that don't
+// supply a callback (e.g. DownloadPlaylistVideo).
+func (d *Downloader) waitForIGSlot(ctx context.Context, rawURL string, progressCb ProgressCallback) error {
+	// Cheap early-out: if the caller has already cancelled, don't bother
+	// parsing the URL or acquiring the lock.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		// Malformed URL — let yt-dlp report the error downstream so callers
+		// don't see two error messages for the same problem.
+		return nil
+	}
+	host := strings.ToLower(u.Hostname())
+	// Empty host (e.g. "https:///path" parses successfully but has no
+	// Hostname()) falls through ungated: neither equals "instagram.com" nor
+	// ends with ".instagram.com", so it is treated like any non-IG URL.
+	isIG := host == "instagram.com" || strings.HasSuffix(host, ".instagram.com")
+	if !isIG {
+		return nil
+	}
+
+	// Critical section is intentionally narrow: read+stamp, no I/O. The
+	// progressCb and the actual sleep happen OUTSIDE this section.
+	d.igMu.Lock()
+	remaining := minIGGap - time.Since(d.igLastAt)
+	if remaining > 0 {
+		// Stamp the projected wake time so other goroutines see "next slot
+		// opens at now+remaining" and queue minIGGap further out. The stamp
+		// stays put even on ctx cancellation below, which preserves the
+		// "unconditional update" invariant for retry storms.
+		d.igLastAt = time.Now().Add(remaining)
+	} else {
+		d.igLastAt = time.Now()
+	}
+	d.igMu.Unlock()
+
+	if remaining > 0 {
+		if progressCb != nil {
+			progressCb(Progress{
+				Phase: "queued",
+				ETA:   remaining.Round(time.Second).String(),
+			})
+		}
+		select {
+		case <-time.After(remaining):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 // Download downloads a video from the given URL using yt-dlp
 func (d *Downloader) Download(ctx context.Context, url string) (*DownloadResult, error) {
 	return d.DownloadWithProgress(ctx, url, nil)
@@ -166,6 +294,13 @@ func (d *Downloader) Download(ctx context.Context, url string) (*DownloadResult,
 
 // DownloadWithProgress downloads a video and reports progress via callback
 func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progressCb ProgressCallback) (*DownloadResult, error) {
+	// Enforce process-wide Instagram rate-limit gap before doing any work.
+	// No-op for non-IG URLs. Must run before creating the work directory so
+	// a cancellation during the wait doesn't leave a stray temp dir.
+	if err := d.waitForIGSlot(ctx, url, progressCb); err != nil {
+		return nil, err
+	}
+
 	// Create unique subdirectory for this download
 	downloadID := fmt.Sprintf("%d", time.Now().UnixNano())
 	workDir := filepath.Join(d.downloadDir, downloadID)
@@ -179,7 +314,9 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	// Build yt-dlp command
 	// Use --newline for parseable progress output
 	// Prefer H.264 sources to avoid re-encoding, but accept any codec (will re-encode later if needed)
-	args := append(cookieArgs(d.cookiesPath),
+	args := throttleArgs()
+	args = append(args, cookieArgs(d.cookiesPath)...)
+	args = append(args,
 		"--no-playlist",
 		// Prefer H.264 (avc1) video + AAC audio sources to avoid re-encoding
 		// Falls back to any codec if H.264 not available
@@ -445,10 +582,36 @@ func formatYtdlpError(err error, stderr string) error {
 	return fmt.Errorf("%w - %s", err, stderr)
 }
 
-// GetPlaylistInfo checks if a URL is a playlist and returns playlist information
+// GetPlaylistInfo checks if a URL is a playlist and returns playlist information.
+//
+// NOTE: this intentionally does NOT call waitForIGSlot. IsPlaylist always
+// precedes the actual download (which IS gated), so gating here would
+// double-charge every IG single-video URL by minIGGap (cold-start single
+// URLs would wait ~8s for metadata then ~8s again for the download — bad UX
+// that the phase-1 fix specifically removed). The metadata fetch is a single
+// short request that Instagram does not flag the same way as a burst of
+// media downloads, so it is safe to leave ungated in the common single-URL
+// case.
+//
+// KNOWN LIMITATION (multi-user concurrent metadata bursts): if N Telegram
+// users send IG URLs simultaneously, all N GetPlaylistInfo metadata fetches
+// run concurrently and ungated. The download gate (DownloadWithProgress)
+// still serializes the heavier traffic that IG actually flags, but the
+// metadata burst is not paced. Empirically this has not caused flagging in
+// production, but it is a real gap.
+//
+// TODO: move the IG rate-limit gate from the downloader layer to a higher
+// request-level point (e.g. engine.Process / engine.IsPlaylist) with
+// one-gate-per-request semantics. That would protect both metadata and
+// download under a single gate without double-charging single URLs. The
+// refactor is non-trivial (engine doesn't currently know about IG host
+// detection or the gate primitive) so it is deferred. Tracked from codex
+// external review 2026-05-10.
 func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*PlaylistInfo, error) {
 	// Use yt-dlp with --flat-playlist --dump-json to check if it's a playlist
-	args := append(cookieArgs(d.cookiesPath),
+	args := throttleArgs()
+	args = append(args, cookieArgs(d.cookiesPath)...)
+	args = append(args,
 		"--flat-playlist",
 		"--dump-json",
 		"--no-warnings",
@@ -558,8 +721,18 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 	}, nil
 }
 
-// DownloadPlaylistVideo downloads a specific video from a playlist
+// DownloadPlaylistVideo downloads a specific video from a playlist.
+//
+// Per-item IG rate limiting: each playlist item is an actual media download
+// (the burst signal Instagram flags), so the gate runs per item. With a 50-item
+// IG playlist at minIGGap=8s the floor wait is 50*8s = ~6min of gating — well
+// within the 15-minute request timeout, and playlists are inherently slow.
 func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL string, videoIndex int, progressCb ProgressCallback) (*DownloadResult, error) {
+	// Enforce per-item IG rate-limit gap.
+	if err := d.waitForIGSlot(ctx, playlistURL, progressCb); err != nil {
+		return nil, err
+	}
+
 	// Create unique subdirectory for this download
 	downloadID := fmt.Sprintf("%d", time.Now().UnixNano())
 	workDir := filepath.Join(d.downloadDir, downloadID)
@@ -572,7 +745,9 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 
 	// Build yt-dlp command for specific playlist item
 	// Remove --no-playlist and use --playlist-items to download specific video
-	args := append(cookieArgs(d.cookiesPath),
+	args := throttleArgs()
+	args = append(args, cookieArgs(d.cookiesPath)...)
+	args = append(args,
 		fmt.Sprintf("--playlist-items=%d", videoIndex+1), // yt-dlp uses 1-based indexing
 		"-f", "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc][height<=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
 		"--merge-output-format", "mp4",

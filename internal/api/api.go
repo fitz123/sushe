@@ -169,8 +169,16 @@ func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWr
 			Status:  phase,
 			Percent: percent,
 		}
-		if phase == "encoding" && detail != "" {
-			evt.Codec = detail
+		switch phase {
+		case "encoding":
+			if detail != "" {
+				evt.Codec = detail
+			}
+		case "queued":
+			// detail carries the remaining wait duration from waitForIGSlot.
+			if detail != "" {
+				evt.ETA = detail
+			}
 		}
 		writeJSON(w, flusher, evt)
 	}

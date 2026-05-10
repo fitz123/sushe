@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -180,4 +181,69 @@ func TestNewEngine(t *testing.T) {
 	eng := NewEngine("")
 	assert.NotNil(t, eng)
 	assert.NotNil(t, eng.downloader)
+}
+
+// TestIsPlaylistShortCircuitsIGSinglePost covers Layer 2 of the IG account
+// exposure reduction: canonical Instagram single-post URLs (/p/, /reel/, /tv/)
+// must NOT invoke GetPlaylistInfo because the URL pattern is syntactically
+// sufficient to classify them as single videos. Doubling the yt-dlp IG hit
+// for every common-case URL was the original problem this short-circuit fixes.
+//
+// We pass a pre-cancelled context: if the short-circuit fails and the call
+// falls through to yt-dlp, exec.CommandContext returns a context error. A
+// successful short-circuit returns (false, nil, nil) without touching the
+// downloader.
+func TestIsPlaylistShortCircuitsIGSinglePost(t *testing.T) {
+	eng := NewEngine("")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled BEFORE the call — yt-dlp would fail immediately if invoked
+
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"/p/<id>/", "https://www.instagram.com/p/CXXXXX/"},
+		{"/reel/<id>/", "https://www.instagram.com/reel/CYYYYY/"},
+		{"/tv/<id>/", "https://www.instagram.com/tv/CZZZZZ/"},
+		{"/reel/<id> with query", "https://www.instagram.com/reel/CYYYYY/?igsh=abc"},
+		{"bare instagram.com /p/", "https://instagram.com/p/CXXXXX/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isPL, info, err := eng.IsPlaylist(ctx, tt.url)
+			require.NoError(t, err, "short-circuit must NOT invoke yt-dlp (would return ctx error)")
+			assert.False(t, isPL, "IG single-post URL must classify as non-playlist")
+			assert.Nil(t, info, "IG single-post short-circuit must not return playlist info")
+		})
+	}
+}
+
+// TestIsPlaylistFallsThroughForNonSinglePostURLs verifies the negative path:
+// when the URL is NOT an IG single-post URL (non-IG host, or IG host with a
+// non-/p|reel|tv/ path), IsPlaylist must fall through to GetPlaylistInfo. We
+// detect fall-through by passing a cancelled context and asserting that an
+// error is returned — the only way IsPlaylist returns an error is via the
+// downstream GetPlaylistInfo call, which exec.CommandContext will fail under
+// a cancelled context.
+func TestIsPlaylistFallsThroughForNonSinglePostURLs(t *testing.T) {
+	eng := NewEngine("")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"IG /explore/", "https://www.instagram.com/explore/"},
+		{"IG /<user>/saved/", "https://www.instagram.com/some_user/saved/"},
+		{"IG profile only", "https://www.instagram.com/some_user/"},
+		{"non-IG youtube playlist", "https://www.youtube.com/playlist?list=PLabc"},
+		{"non-IG tiktok", "https://www.tiktok.com/@user/video/12345"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := eng.IsPlaylist(ctx, tt.url)
+			assert.Error(t, err, "non-single-post URLs must fall through to yt-dlp (ctx cancelled → error)")
+		})
+	}
 }

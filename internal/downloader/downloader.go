@@ -94,9 +94,39 @@ const (
 	// within a single invocation; a bot serving multiple Telegram users can
 	// still fire N IG requests in 2 seconds when users paste URLs concurrently.
 	// Instagram flags such bursts hardest, so a process-wide mutex enforces
-	// this gap. 8s is a starting point — tune up if flagging persists, down
-	// if users complain about latency.
-	minIGGap = 8 * time.Second
+	// this gap.
+	//
+	// 15s baseline: production logs showed flagging after ~8 successes per 46s
+	// (~10 req/min). 15s spacing gives ~8 successes in 105s (~4.6 req/min),
+	// ~50% headroom under the observed flag rate. Tune up if flagging persists,
+	// down if users complain about latency.
+	minIGGap = 15 * time.Second
+
+	// igCooldown is the global pause applied to Instagram-bound yt-dlp
+	// invocations after yt-dlp surfaces an IG rate-limit / login-required
+	// error (see isIGRateLimit). Without a cooldown, the bot keeps hammering
+	// IG every minIGGap when the account is already flagged, which deepens
+	// the flag. 5 minutes gives IG's rate-limit window time to clear without
+	// requiring operator intervention on transient flags.
+	//
+	// Cooldown is reset (slid forward) every time noteIGRateLimit is called,
+	// so consecutive rate-limit responses keep the bot quiet rather than
+	// resuming after exactly 5 minutes from the first flag.
+	igCooldown = 5 * time.Minute
+
+	// igIosAppID is the X-IG-App-ID value yt-dlp surfaces via
+	// `--extractor-args "instagram:app_id=..."` (yt-dlp PR #12359). The default
+	// `936619743392459` is the web-app id; web-app sessions from a Hetzner
+	// datacenter range look maximally suspicious to IG. `124024574287414` is
+	// the iOS-app id, which routes requests to a different IG endpoint cluster
+	// with a different rate profile. Must be paired with an iOS-app UA — a
+	// mismatched UA + app_id pair is itself a flag signal.
+	igIosAppID = "124024574287414"
+	// igIosUA matches the iOS-app id above. App version 339.0.0.12.95 was a
+	// real mid-2024 release; refresh annually to avoid looking like a stale
+	// client. Build-id suffix (e.g. "; 580058661") intentionally omitted — the
+	// X-IG-App-ID header is the dominant signal for IG's endpoint routing.
+	igIosUA = "Instagram 339.0.0.12.95 (iPhone16,1; iOS 18_2; en_US; en_US; scale=3.00; gamut=normal; 1179x2556) AppleWebKit/420+"
 )
 
 // MediaInfo contains video metadata from ffprobe
@@ -151,13 +181,21 @@ type Downloader struct {
 	timeout     time.Duration
 	cookiesPath string
 
-	// igMu guards igLastAt and serializes Instagram-bound yt-dlp invocations
-	// across all goroutines. See waitForIGSlot for the rationale.
+	// igMu guards igLastAt and igCooldownUntil and serializes Instagram-bound
+	// yt-dlp invocations across all goroutines. See waitForIGSlot for the
+	// rationale.
 	igMu sync.Mutex
 	// igLastAt is the wall-clock time of the most recent Instagram-bound
 	// yt-dlp invocation. Zero value means "never seen IG before" — the
 	// first IG call passes through immediately.
 	igLastAt time.Time
+	// igCooldownUntil is the wall-clock deadline until which Instagram-bound
+	// yt-dlp invocations must wait, set by noteIGRateLimit after yt-dlp
+	// returns an IG rate-limit / login-required error. Zero value (or any
+	// time in the past) means "no active cooldown" — waitForIGSlot falls back
+	// to the minIGGap-only behavior. See waitForIGSlot for how cooldown and
+	// minIGGap combine (whichever requires the longer wait wins).
+	igCooldownUntil time.Time
 }
 
 // New creates a Downloader. If cookiesPath is non-empty, every yt-dlp invocation
@@ -208,6 +246,112 @@ func New(cookiesPath string) *Downloader {
 	}
 }
 
+// igSinglePostRe matches the path of an Instagram single-post URL — one of
+// /p/<id>, /reel/<id>, or /tv/<id> with an optional trailing slash and any
+// suffix (query string, sub-path). Used by IsInstagramSinglePost to decide
+// whether IsPlaylist can short-circuit the yt-dlp metadata fetch.
+var igSinglePostRe = regexp.MustCompile(`^/(p|reel|tv)/[^/]+/?`)
+
+// isInstagramHost returns true when rawURL's hostname matches instagram.com
+// or *.instagram.com (e.g. www.instagram.com, m.instagram.com). Confusables
+// like evilinstagram.com and instagram.com.evil.com are excluded.
+//
+// Shared by waitForIGSlot (rate-limit gate) and igExtractorArgs (Layer 0 args)
+// so both use one source of truth — drift between the gate and the args would
+// either leak the web-app fingerprint on gated IG traffic or apply the iOS
+// fingerprint to non-IG hosts. Parse error or empty host returns false.
+func isInstagramHost(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	return host == "instagram.com" || strings.HasSuffix(host, ".instagram.com")
+}
+
+// IsInstagramSinglePost returns true when rawURL is an Instagram URL pointing
+// at a single post (/p/, /reel/, /tv/). Used by engine.IsPlaylist to skip the
+// yt-dlp metadata preflight for URLs that are syntactically guaranteed to be
+// single videos — halving the IG signal for the common case.
+//
+// Host matching uses isInstagramHost (instagram.com or *.instagram.com), so
+// confusables like evilinstagram.com are excluded. A parse error or non-IG
+// host returns false; the caller falls through to the existing GetPlaylistInfo
+// call.
+func IsInstagramSinglePost(rawURL string) bool {
+	if !isInstagramHost(rawURL) {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return igSinglePostRe.MatchString(u.Path)
+}
+
+// igExtractorArgs returns IG-specific yt-dlp flags for Instagram URLs:
+//
+//   - --extractor-args "instagram:app_id=124024574287414" (iOS app id; yt-dlp
+//     PR #12359). Default web-app id `936619743392459` plus a Hetzner-range
+//     datacenter IP is maximally suspicious to IG; the iOS app id routes
+//     requests to a different IG endpoint cluster with a different rate
+//     profile.
+//   - --user-agent <iOS UA>. Must match the iOS app id — mismatched UA +
+//     app_id pairs are themselves a flag signal.
+//   - --retries 1 / --fragment-retries 1. Overrides the global --retries 3 /
+//     --fragment-retries 3 from throttleArgs (yt-dlp's last-wins arg parsing).
+//     IG escalates flags after 429-retry storms, especially fragment retries
+//     where one bad fragment × 3 retries × N fragments multiplies the
+//     rate-limit signal. Better to fail fast and let cookies fallback / the
+//     cooldown handle the actual recovery.
+//
+// Returns nil for non-IG URLs so YouTube / Twitter / TikTok keep the existing
+// throttle stack with the desktop Firefox UA.
+//
+// Order at call sites: prepended AFTER throttleArgs() and cookieArgs(...) so
+// the IG-specific UA / retries / fragment-retries override the desktop
+// defaults via yt-dlp's last-wins arg parsing.
+//
+// Returns a fresh slice each call so callers can safely append onto it
+// (consistent with cookieArgs / throttleArgs).
+func igExtractorArgs(rawURL string) []string {
+	if !isInstagramHost(rawURL) {
+		return nil
+	}
+	return []string{
+		"--extractor-args", "instagram:app_id=" + igIosAppID,
+		"--user-agent", igIosUA,
+		"--retries", "1",
+		"--fragment-retries", "1",
+	}
+}
+
+// isIGRateLimit returns true when err looks like an Instagram rate-limit /
+// auth-required response from yt-dlp. The check is a substring match against
+// the formatted error message (which formatYtdlpError populates with the
+// captured stderr from yt-dlp, including IG's `Requested content is not
+// available, rate-limit reached or login required` string, HTTP 429
+// responses, and generic `login required` failures for stories/private
+// content). errors.Unwrap chains are covered automatically because err.Error()
+// includes wrapped error messages via fmt.Errorf("%w") semantics.
+//
+// Conservative match — a false positive only triggers an extra cooldown or a
+// cookies-fallback retry, both of which are safe. A false negative would let
+// the bot keep hammering IG during a flag, which is exactly the failure mode
+// this PR exists to prevent, so we err on the side of matching too eagerly.
+func isIGRateLimit(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "rate-limit reached or login required") ||
+		strings.Contains(msg, "HTTP Error 429") ||
+		strings.Contains(msg, "login required")
+}
+
 // waitForIGSlot enforces a process-wide minimum gap (minIGGap) between
 // Instagram-bound yt-dlp invocations. For non-Instagram URLs (and unparseable
 // URLs) it returns nil immediately without acquiring the lock. For IG URLs,
@@ -224,10 +368,9 @@ func New(cookiesPath string) *Downloader {
 // progressCb is invoked OUTSIDE the lock so a slow Telegram edit by one
 // goroutine cannot block other goroutines waiting for an IG slot.
 //
-// Host matching uses Hostname() (port stripped) with an exact-or-suffix-with-dot
-// rule: `host == "instagram.com" || strings.HasSuffix(host, ".instagram.com")`.
-// This catches www/m.instagram.com while excluding confusables like
-// `evilinstagram.com` and substring-in-path/query false positives.
+// Host matching delegates to isInstagramHost (instagram.com or
+// *.instagram.com via Hostname() with port stripped). Confusables like
+// evilinstagram.com and substring-in-path/query false positives are excluded.
 //
 // A `Progress{Phase: "queued", ETA: <remaining>}` event is emitted via
 // progressCb EXACTLY ONCE per call, and only when an actual wait is needed
@@ -241,25 +384,26 @@ func (d *Downloader) waitForIGSlot(ctx context.Context, rawURL string, progressC
 		return err
 	}
 
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		// Malformed URL — let yt-dlp report the error downstream so callers
-		// don't see two error messages for the same problem.
-		return nil
-	}
-	host := strings.ToLower(u.Hostname())
-	// Empty host (e.g. "https:///path" parses successfully but has no
-	// Hostname()) falls through ungated: neither equals "instagram.com" nor
-	// ends with ".instagram.com", so it is treated like any non-IG URL.
-	isIG := host == "instagram.com" || strings.HasSuffix(host, ".instagram.com")
-	if !isIG {
+	// Host match (parse error / non-IG / empty host all return false and fall
+	// through ungated; malformed URLs let yt-dlp report the error so callers
+	// don't see two error messages for the same problem).
+	if !isInstagramHost(rawURL) {
 		return nil
 	}
 
 	// Critical section is intentionally narrow: read+stamp, no I/O. The
 	// progressCb and the actual sleep happen OUTSIDE this section.
 	d.igMu.Lock()
+	// Two waits are in play: (a) the minIGGap spacing between consecutive IG
+	// invocations, and (b) the cooldown applied after a rate-limit error.
+	// Whichever requires the longer remaining wait wins. Cooldown of zero
+	// (never tripped, or already elapsed) yields a non-positive
+	// cooldownRemaining and effectively no-ops.
 	remaining := minIGGap - time.Since(d.igLastAt)
+	cooldownRemaining := time.Until(d.igCooldownUntil)
+	if cooldownRemaining > remaining {
+		remaining = cooldownRemaining
+	}
 	if remaining > 0 {
 		// Stamp the projected wake time so other goroutines see "next slot
 		// opens at now+remaining" and queue minIGGap further out. The stamp
@@ -287,6 +431,25 @@ func (d *Downloader) waitForIGSlot(ctx context.Context, rawURL string, progressC
 	return nil
 }
 
+// noteIGRateLimit records an Instagram rate-limit / login-required error from
+// yt-dlp by setting the cooldown deadline to now + igCooldown. Subsequent
+// IG-bound invocations call waitForIGSlot, which honors the deadline and
+// blocks until it expires (or until ctx is cancelled).
+//
+// Idempotent under concurrent calls: each invocation slides the deadline
+// forward to now + igCooldown rather than extending from the previous
+// deadline. This gives "5 minutes from the last bad signal" semantics, which
+// is what we want — if IG keeps returning rate-limit responses, the bot keeps
+// pausing rather than resuming after a fixed window from the first flag.
+//
+// Holds d.igMu only long enough to assign the deadline. Callers must NOT hold
+// d.igMu when calling this method (would deadlock).
+func (d *Downloader) noteIGRateLimit() {
+	d.igMu.Lock()
+	d.igCooldownUntil = time.Now().Add(igCooldown)
+	d.igMu.Unlock()
+}
+
 // Download downloads a video from the given URL using yt-dlp
 func (d *Downloader) Download(ctx context.Context, url string) (*DownloadResult, error) {
 	return d.DownloadWithProgress(ctx, url, nil)
@@ -311,12 +474,17 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	// Output template
 	outputTemplate := filepath.Join(workDir, "%(title).100s.%(ext)s")
 
-	// Build yt-dlp command
-	// Use --newline for parseable progress output
-	// Prefer H.264 sources to avoid re-encoding, but accept any codec (will re-encode later if needed)
-	args := throttleArgs()
-	args = append(args, cookieArgs(d.cookiesPath)...)
-	args = append(args,
+	// Build yt-dlp args WITHOUT cookies — runWithCookieFallback inserts cookies
+	// per attempt (anonymous first, then d.cookiesPath on IG-rate-limit retry).
+	// Use --newline for parseable progress output. Prefer H.264 sources to
+	// avoid re-encoding, but accept any codec (will re-encode later if needed).
+	baseArgs := throttleArgs()
+	// igExtractorArgs appended AFTER throttleArgs so the IG-specific UA /
+	// retries / fragment-retries override throttle defaults via yt-dlp's
+	// last-wins arg parsing. Returns nil for non-IG URLs (no effect on
+	// YouTube / TikTok / etc).
+	baseArgs = append(baseArgs, igExtractorArgs(url)...)
+	baseArgs = append(baseArgs,
 		"--no-playlist",
 		// Prefer H.264 (avc1) video + AAC audio sources to avoid re-encoding
 		// Falls back to any codec if H.264 not available
@@ -330,29 +498,10 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 		url,
 	)
 
-	logger.Debug("Running yt-dlp", "args", args)
-
-	// Create context with timeout
-	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(cmdCtx, "yt-dlp", args...)
-	cmd.Dir = workDir
-
-	// If we have a progress callback, stream output; otherwise use simple execution
-	if progressCb != nil {
-		if err := d.runWithProgress(cmd, progressCb); err != nil {
-			logger.Error("yt-dlp failed", "error", err)
-			os.RemoveAll(workDir)
-			return nil, fmt.Errorf("download failed: %w", err)
-		}
-	} else {
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			logger.Error("yt-dlp failed", "error", err, "output", string(output))
-			os.RemoveAll(workDir)
-			return nil, fmt.Errorf("download failed: %w - %s", err, string(output))
-		}
+	if err := d.runWithCookieFallback(ctx, workDir, baseArgs, progressCb); err != nil {
+		logger.Error("yt-dlp failed", "error", err)
+		os.RemoveAll(workDir)
+		return nil, fmt.Errorf("download failed: %w", err)
 	}
 
 	// Find the downloaded file
@@ -582,6 +731,93 @@ func formatYtdlpError(err error, stderr string) error {
 	return fmt.Errorf("%w - %s", err, stderr)
 }
 
+// shouldRetryWithCookies returns true when err matches an Instagram rate-limit /
+// auth-required response AND a non-empty cookies path is available for the
+// retry. Pure function — the retry loop in runWithCookieFallback calls this
+// rather than inlining the boolean so the decision is unit-testable without
+// touching exec.Cmd.
+//
+// The "cookies non-empty" guard is what makes "anonymous-first, cookies-as-
+// fallback" work safely when the bot is started without SUSHE_COOKIES: a
+// non-IG-friendly account is better than no account at all, but no account is
+// better than retrying anonymously with the same args and the same outcome.
+func shouldRetryWithCookies(err error, cookiesPath string) bool {
+	return isIGRateLimit(err) && cookiesPath != ""
+}
+
+// runWithCookieFallback runs yt-dlp with try-anonymous-first semantics. baseArgs
+// must include throttleArgs, igExtractorArgs (when applicable), all other
+// yt-dlp flags, and the URL — but NOT cookieArgs (the helper manages cookies
+// across the anonymous attempt and the cookies retry).
+//
+// Behavior:
+//
+//  1. First attempt: anonymous (cookieArgs("") → no --cookies flag). Most
+//     public Instagram posts download here without ever touching the bot's
+//     IG account, keeping that account clean for the majority of traffic.
+//  2. If the anonymous attempt fails AND shouldRetryWithCookies(err,
+//     d.cookiesPath) → partial output is cleaned from workDir and the
+//     invocation is retried with d.cookiesPath.
+//  3. If the final returned error is an IG rate-limit, d.noteIGRateLimit()
+//     is called so subsequent goroutines back off via waitForIGSlot's
+//     cooldown branch — defense in depth on top of the cookies fallback.
+//
+// Layer 0's igExtractorArgs (iOS app_id + iOS UA + retries=1) must already be
+// present in baseArgs and is therefore applied identically on both the
+// anonymous attempt and the cookies retry — every IG-bound yt-dlp invocation
+// shows the iOS fingerprint, regardless of cookies state.
+func (d *Downloader) runWithCookieFallback(ctx context.Context, workDir string, baseArgs []string, progressCb ProgressCallback) error {
+	runOnce := func(cookiesPath string) error {
+		// Prepend cookies (or nothing, for the anonymous attempt) so the
+		// final args order is [cookies, throttle, igExtractor, ..., url].
+		// Cookies position relative to throttle/igExtractor does not affect
+		// yt-dlp parsing (no flag duplication), and URL must remain last.
+		args := append(cookieArgs(cookiesPath), baseArgs...)
+		logger.Debug("Running yt-dlp", "args", args, "anonymous", cookiesPath == "")
+
+		cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
+		defer cancel()
+
+		cmd := exec.CommandContext(cmdCtx, "yt-dlp", args...)
+		cmd.Dir = workDir
+
+		if progressCb != nil {
+			// runWithProgress already wraps with formatYtdlpError, so the
+			// returned error carries the IG stderr that isIGRateLimit needs.
+			return d.runWithProgress(cmd, progressCb)
+		}
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return formatYtdlpError(err, string(output))
+		}
+		return nil
+	}
+
+	err := runOnce("")
+	if err == nil {
+		return nil
+	}
+
+	if shouldRetryWithCookies(err, d.cookiesPath) {
+		logger.Info("Anonymous yt-dlp attempt hit IG rate-limit; retrying with cookies", "error", err)
+		// Remove partial output from the failed anonymous attempt so the
+		// caller's glob picks up only the retry's files. ReadDir errors
+		// here are non-fatal (the retry's overwrite via -o + the caller's
+		// glob will surface any real problem).
+		if entries, gerr := os.ReadDir(workDir); gerr == nil {
+			for _, e := range entries {
+				os.RemoveAll(filepath.Join(workDir, e.Name()))
+			}
+		}
+		err = runOnce(d.cookiesPath)
+	}
+
+	if isIGRateLimit(err) {
+		d.noteIGRateLimit()
+	}
+	return err
+}
+
 // GetPlaylistInfo checks if a URL is a playlist and returns playlist information.
 //
 // NOTE: this intentionally does NOT call waitForIGSlot. IsPlaylist always
@@ -611,6 +847,10 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 	// Use yt-dlp with --flat-playlist --dump-json to check if it's a playlist
 	args := throttleArgs()
 	args = append(args, cookieArgs(d.cookiesPath)...)
+	// igExtractorArgs appended AFTER throttleArgs/cookieArgs so the IG-specific
+	// UA / retries / fragment-retries override throttle defaults via yt-dlp's
+	// last-wins arg parsing. Returns nil for non-IG URLs.
+	args = append(args, igExtractorArgs(url)...)
 	args = append(args,
 		"--flat-playlist",
 		"--dump-json",
@@ -623,7 +863,20 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get playlist info: %w", err)
+		// cmd.Output() captures stderr into ExitError.Stderr when cmd.Stderr
+		// is nil. Surface it through formatYtdlpError so isIGRateLimit can
+		// inspect the wrapped message and fire noteIGRateLimit — without
+		// this, IG rate-limit responses on the (rare) playlist metadata
+		// fetch would not back off the global gate.
+		var stderrText string
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderrText = string(ee.Stderr)
+		}
+		wrappedErr := formatYtdlpError(err, stderrText)
+		if isIGRateLimit(wrappedErr) {
+			d.noteIGRateLimit()
+		}
+		return nil, fmt.Errorf("failed to get playlist info: %w", wrappedErr)
 	}
 
 	// Parse the JSON lines output
@@ -743,11 +996,15 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	// Output template
 	outputTemplate := filepath.Join(workDir, "%(title).100s.%(ext)s")
 
-	// Build yt-dlp command for specific playlist item
-	// Remove --no-playlist and use --playlist-items to download specific video
-	args := throttleArgs()
-	args = append(args, cookieArgs(d.cookiesPath)...)
-	args = append(args,
+	// Build yt-dlp args WITHOUT cookies — runWithCookieFallback inserts cookies
+	// per attempt (anonymous first, then d.cookiesPath on IG-rate-limit retry).
+	// Remove --no-playlist and use --playlist-items to download specific video.
+	baseArgs := throttleArgs()
+	// igExtractorArgs appended AFTER throttleArgs so the IG-specific UA /
+	// retries / fragment-retries override throttle defaults via yt-dlp's
+	// last-wins arg parsing. Returns nil for non-IG URLs.
+	baseArgs = append(baseArgs, igExtractorArgs(playlistURL)...)
+	baseArgs = append(baseArgs,
 		fmt.Sprintf("--playlist-items=%d", videoIndex+1), // yt-dlp uses 1-based indexing
 		"-f", "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc][height<=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
 		"--merge-output-format", "mp4",
@@ -758,29 +1015,10 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 		playlistURL,
 	)
 
-	logger.Debug("Downloading playlist video", "index", videoIndex, "args", args)
-
-	// Create context with timeout
-	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(cmdCtx, "yt-dlp", args...)
-	cmd.Dir = workDir
-
-	// If we have a progress callback, stream output; otherwise use simple execution
-	if progressCb != nil {
-		if err := d.runWithProgress(cmd, progressCb); err != nil {
-			logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err)
-			os.RemoveAll(workDir)
-			return nil, fmt.Errorf("download failed: %w", err)
-		}
-	} else {
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err, "output", string(output))
-			os.RemoveAll(workDir)
-			return nil, fmt.Errorf("download failed: %w - %s", err, string(output))
-		}
+	if err := d.runWithCookieFallback(ctx, workDir, baseArgs, progressCb); err != nil {
+		logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err)
+		os.RemoveAll(workDir)
+		return nil, fmt.Errorf("download failed: %w", err)
 	}
 
 	// Find the downloaded file

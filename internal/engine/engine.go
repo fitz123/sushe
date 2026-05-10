@@ -161,7 +161,17 @@ func (e *Engine) ProcessPlaylist(ctx context.Context, url string, progressCb fun
 }
 
 // IsPlaylist checks if a URL is a playlist and returns playlist info if so.
+//
+// For Instagram URLs that match the canonical single-post pattern (/p/, /reel/,
+// /tv/), skip the yt-dlp metadata preflight entirely — these URLs are
+// syntactically guaranteed to be single videos, so calling GetPlaylistInfo
+// would double the IG-extractor signal for the common case and accelerate
+// account flagging. See docs/plans/20260511-ig-reduce-account-exposure.md
+// (Layer 2) for the rationale.
 func (e *Engine) IsPlaylist(ctx context.Context, url string) (bool, *downloader.PlaylistInfo, error) {
+	if downloader.IsInstagramSinglePost(url) {
+		return false, nil, nil
+	}
 	info, err := e.downloader.GetPlaylistInfo(ctx, url)
 	if err != nil {
 		return false, nil, err

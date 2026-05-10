@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -663,4 +664,647 @@ func TestWaitForIGSlot(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
+}
+
+// TestIsInstagramHost covers the host-match helper shared by waitForIGSlot
+// (rate-limit gate) and igExtractorArgs (Layer 0 args). Table-driven across
+// the canonical IG hosts (www, m, bare), confusables that must NOT match
+// (evilinstagram.com, instagram.com.evil.com), non-IG hosts, and parse-error
+// edges (malformed URL, empty string, empty hostname).
+func TestIsInstagramHost(t *testing.T) {
+	tests := []struct {
+		name   string
+		rawURL string
+		want   bool
+	}{
+		// Positive: canonical IG hosts.
+		{"www.instagram.com", "https://www.instagram.com/p/abc/", true},
+		{"bare instagram.com", "https://instagram.com/p/abc/", true},
+		{"m.instagram.com mobile", "https://m.instagram.com/reel/xyz/", true},
+		{"instagram.com with port", "https://instagram.com:443/p/abc/", true},
+		{"uppercase host normalized", "https://WWW.INSTAGRAM.COM/p/abc/", true},
+
+		// Negative: confusable hosts that must NOT match (security-critical).
+		{"evilinstagram.com", "https://evilinstagram.com/p/abc/", false},
+		{"instagram.com.evil.com", "https://instagram.com.evil.com/p/abc/", false},
+		{"notinstagram.com", "https://notinstagram.com/", false},
+
+		// Negative: unrelated hosts.
+		{"youtube.com", "https://www.youtube.com/watch?v=abc", false},
+		{"tiktok.com", "https://www.tiktok.com/@user/video/12345", false},
+		{"twitter.com", "https://twitter.com/user/status/1", false},
+
+		// Edge: parse errors and empty hosts must return false.
+		{"malformed URL with IPv6 bracket", "http://[::1", false},
+		{"empty string", "", false},
+		{"empty host (https:///path)", "https:///path", false},
+		{"substring instagram in path", "https://example.com/instagram.com/p/abc/", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isInstagramHost(tt.rawURL); got != tt.want {
+				t.Errorf("isInstagramHost(%q) = %v, want %v", tt.rawURL, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIgExtractorArgs covers the Layer 0 helper that returns IG-specific
+// yt-dlp flags (iOS app id + iOS UA + retries=1 + fragment-retries=1) for
+// Instagram URLs and nil for everything else.
+//
+// The exact flag values are load-bearing for IG anti-flag posture — drift in
+// the app_id, UA, or retry counts would silently regress the iOS-fingerprint
+// strategy. Spot-checking each flag here makes the values reviewable.
+func TestIgExtractorArgs(t *testing.T) {
+	t.Run("IG URL returns iOS extractor args", func(t *testing.T) {
+		got := igExtractorArgs("https://www.instagram.com/reel/abc/")
+		want := []string{
+			"--extractor-args", "instagram:app_id=124024574287414",
+			"--user-agent", "Instagram 339.0.0.12.95 (iPhone16,1; iOS 18_2; en_US; en_US; scale=3.00; gamut=normal; 1179x2556) AppleWebKit/420+",
+			"--retries", "1",
+			"--fragment-retries", "1",
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("igExtractorArgs(IG) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("bare instagram.com host matches", func(t *testing.T) {
+		got := igExtractorArgs("https://instagram.com/p/abc/")
+		if len(got) != 8 {
+			t.Errorf("expected 8 args, got %d: %v", len(got), got)
+		}
+	})
+
+	t.Run("m.instagram.com subdomain matches", func(t *testing.T) {
+		got := igExtractorArgs("https://m.instagram.com/p/abc/")
+		if len(got) != 8 {
+			t.Errorf("expected 8 args for m.instagram.com, got %d: %v", len(got), got)
+		}
+	})
+
+	t.Run("non-IG URL returns nil", func(t *testing.T) {
+		for _, u := range []string{
+			"https://youtube.com/watch?v=abc",
+			"https://www.tiktok.com/@user/video/12345",
+			"https://twitter.com/user/status/1",
+			"https://evilinstagram.com/p/abc/",
+			"https://instagram.com.evil.com/p/abc/",
+		} {
+			got := igExtractorArgs(u)
+			if got != nil {
+				t.Errorf("igExtractorArgs(%q) = %v, want nil", u, got)
+			}
+		}
+	})
+
+	t.Run("parse error returns nil", func(t *testing.T) {
+		got := igExtractorArgs("http://[::1")
+		if got != nil {
+			t.Errorf("igExtractorArgs(malformed) = %v, want nil", got)
+		}
+	})
+
+	t.Run("fresh slice each call (append-safe)", func(t *testing.T) {
+		igURL := "https://www.instagram.com/p/abc/"
+		a := append(igExtractorArgs(igURL), "tail-a")
+		b := append(igExtractorArgs(igURL), "tail-b")
+		if a[len(a)-1] != "tail-a" {
+			t.Errorf("a tail = %q, want tail-a", a[len(a)-1])
+		}
+		if b[len(b)-1] != "tail-b" {
+			t.Errorf("b tail = %q, want tail-b", b[len(b)-1])
+		}
+		if a[len(a)-1] == b[len(b)-1] {
+			t.Errorf("igExtractorArgs returns shared backing array; appends cross-contaminated")
+		}
+	})
+
+	t.Run("flag values spot-check", func(t *testing.T) {
+		got := igExtractorArgs("https://www.instagram.com/reel/abc/")
+		// iOS app_id must be 124024574287414 (PR #12359), not the web-app
+		// default 936619743392459.
+		foundAppID := false
+		for i := 0; i < len(got)-1; i++ {
+			if got[i] == "--extractor-args" && got[i+1] == "instagram:app_id=124024574287414" {
+				foundAppID = true
+			}
+		}
+		if !foundAppID {
+			t.Errorf("expected --extractor-args instagram:app_id=124024574287414, got %v", got)
+		}
+		// iOS UA must start with "Instagram " — this is what differentiates it
+		// from the desktop Firefox UA in throttleArgs.
+		foundUA := false
+		for i := 0; i < len(got)-1; i++ {
+			if got[i] == "--user-agent" && strings.HasPrefix(got[i+1], "Instagram ") {
+				foundUA = true
+			}
+		}
+		if !foundUA {
+			t.Errorf("expected --user-agent starting with 'Instagram ', got %v", got)
+		}
+	})
+}
+
+// TestIgArgsOverrideThrottle is the load-bearing integration test for the
+// "last-wins" arg-parsing invariant: when igExtractorArgs is appended AFTER
+// throttleArgs/cookieArgs at a call site (the order the production call sites
+// use), yt-dlp's left-to-right arg parser picks up the IG-specific values for
+// --user-agent, --retries, and --fragment-retries.
+//
+// If a future refactor reorders the args, the IG values would stop overriding
+// and the web-app UA + retries=3 would leak — the very regression Layer 0
+// exists to prevent. This test anchors the invariant in CI.
+func TestIgArgsOverrideThrottle(t *testing.T) {
+	t.Run("IG URL: last --user-agent / --retries / --fragment-retries wins", func(t *testing.T) {
+		igURL := "https://www.instagram.com/reel/abc/"
+		args := append(throttleArgs(), cookieArgs("")...)
+		args = append(args, igExtractorArgs(igURL)...)
+
+		// --user-agent must appear exactly twice (desktop Firefox from
+		// throttleArgs, then iOS from igExtractorArgs). The LAST occurrence
+		// must be the iOS UA — that's the one yt-dlp's last-wins parser uses.
+		uaIdxs := indexAllOf(args, "--user-agent")
+		if len(uaIdxs) != 2 {
+			t.Errorf("expected --user-agent to appear exactly 2x, got %d at %v: %v", len(uaIdxs), uaIdxs, args)
+		}
+		if len(uaIdxs) >= 1 {
+			lastUAValue := args[uaIdxs[len(uaIdxs)-1]+1]
+			if !strings.HasPrefix(lastUAValue, "Instagram ") {
+				t.Errorf("expected LAST --user-agent value to start with 'Instagram ', got %q", lastUAValue)
+			}
+		}
+
+		// --retries must appear exactly twice (3 from throttleArgs, 1 from
+		// igExtractorArgs). Last value must be "1".
+		retriesIdxs := indexAllOf(args, "--retries")
+		if len(retriesIdxs) != 2 {
+			t.Errorf("expected --retries to appear exactly 2x, got %d at %v", len(retriesIdxs), retriesIdxs)
+		}
+		if len(retriesIdxs) >= 1 {
+			lastVal := args[retriesIdxs[len(retriesIdxs)-1]+1]
+			if lastVal != "1" {
+				t.Errorf("expected LAST --retries value to be %q, got %q", "1", lastVal)
+			}
+		}
+
+		// --fragment-retries must appear exactly twice. Last value must be "1".
+		fragIdxs := indexAllOf(args, "--fragment-retries")
+		if len(fragIdxs) != 2 {
+			t.Errorf("expected --fragment-retries to appear exactly 2x, got %d at %v", len(fragIdxs), fragIdxs)
+		}
+		if len(fragIdxs) >= 1 {
+			lastVal := args[fragIdxs[len(fragIdxs)-1]+1]
+			if lastVal != "1" {
+				t.Errorf("expected LAST --fragment-retries value to be %q, got %q", "1", lastVal)
+			}
+		}
+
+		// --extractor-args "instagram:app_id=124024574287414" must be present.
+		extractorIdxs := indexAllOf(args, "--extractor-args")
+		if len(extractorIdxs) != 1 {
+			t.Errorf("expected --extractor-args to appear exactly 1x, got %d", len(extractorIdxs))
+		}
+		if len(extractorIdxs) >= 1 {
+			val := args[extractorIdxs[0]+1]
+			if val != "instagram:app_id=124024574287414" {
+				t.Errorf("expected --extractor-args value %q, got %q", "instagram:app_id=124024574287414", val)
+			}
+		}
+	})
+
+	t.Run("non-IG URL: only throttle defaults remain", func(t *testing.T) {
+		ytURL := "https://www.youtube.com/watch?v=abc"
+		args := append(throttleArgs(), cookieArgs("")...)
+		args = append(args, igExtractorArgs(ytURL)...)
+
+		// --user-agent / --retries / --fragment-retries each appear exactly
+		// once (only the throttleArgs defaults; igExtractorArgs returns nil
+		// for non-IG).
+		for _, flag := range []string{"--user-agent", "--retries", "--fragment-retries"} {
+			idxs := indexAllOf(args, flag)
+			if len(idxs) != 1 {
+				t.Errorf("non-IG URL: expected %s to appear exactly 1x, got %d", flag, len(idxs))
+			}
+		}
+
+		// --extractor-args must NOT appear.
+		if len(indexAllOf(args, "--extractor-args")) != 0 {
+			t.Errorf("non-IG URL: expected zero --extractor-args, got %v", indexAllOf(args, "--extractor-args"))
+		}
+
+		// Sanity: the single --user-agent must be the desktop Firefox value
+		// from throttleArgs (i.e. NOT the iOS UA — otherwise the iOS pair
+		// would be leaking to non-IG traffic, the inverse regression).
+		uaIdxs := indexAllOf(args, "--user-agent")
+		if len(uaIdxs) >= 1 {
+			val := args[uaIdxs[0]+1]
+			if strings.HasPrefix(val, "Instagram ") {
+				t.Errorf("non-IG URL: --user-agent leaked iOS value %q", val)
+			}
+		}
+	})
+}
+
+// TestMinIGGapValue guards the minIGGap baseline against accidental drift.
+// 15s is the production-tuned value (see comment in downloader.go): ~50%
+// headroom under the observed flag rate of ~10 req/min. If a future refactor
+// drops it back to 8s or below, this test fails — flagging would resume.
+func TestMinIGGapValue(t *testing.T) {
+	if minIGGap < 15*time.Second {
+		t.Errorf("minIGGap = %v, want >= 15s (production-tuned baseline for IG anti-flag posture)", minIGGap)
+	}
+}
+
+// indexAllOf returns the indices of every occurrence of target in haystack.
+// Used by TestIgArgsOverrideThrottle to assert "exactly twice" / "last wins"
+// invariants without committing to the exact slice ordering.
+func indexAllOf(haystack []string, target string) []int {
+	var out []int
+	for i, s := range haystack {
+		if s == target {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// TestIsInstagramSinglePost covers the URL classifier used by engine.IsPlaylist
+// to skip yt-dlp preflight for single-post IG URLs. Table-driven across the
+// three canonical post types (/p/, /reel/, /tv/), non-single-post IG paths
+// (explore, saved, stories, root), confusable hosts, and parse-error edges.
+func TestIsInstagramSinglePost(t *testing.T) {
+	tests := []struct {
+		name   string
+		rawURL string
+		want   bool
+	}{
+		// Positive: canonical single-post URLs.
+		{"/p/<id>/", "https://www.instagram.com/p/CXXXXX/", true},
+		{"/p/<id> no trailing slash", "https://www.instagram.com/p/CXXXXX", true},
+		{"/reel/<id>/", "https://www.instagram.com/reel/CYYYYY/", true},
+		{"/reel/<id> no trailing slash", "https://instagram.com/reel/CYYYYY", true},
+		{"/tv/<id>/", "https://www.instagram.com/tv/CZZZZZ/", true},
+		{"/p/<id>/ with query string", "https://www.instagram.com/p/CXXXXX/?igsh=abc123", true},
+		{"/reel/<id>/ with utm tracking", "https://www.instagram.com/reel/CYYYYY/?utm_source=ig", true},
+		{"m.instagram.com mobile subdomain", "https://m.instagram.com/p/CXXXXX/", true},
+		{"bare instagram.com (no www)", "https://instagram.com/p/CXXXXX/", true},
+		{"/p/<id>/sub-path", "https://www.instagram.com/p/CXXXXX/embed/", true},
+
+		// Negative: IG host but not a single-post path.
+		{"root path", "https://www.instagram.com/", false},
+		{"/explore/", "https://www.instagram.com/explore/", false},
+		{"/<username>/saved/", "https://www.instagram.com/some_user/saved/", false},
+		{"/stories/<user>/<id>", "https://www.instagram.com/stories/some_user/123456/", false},
+		{"/<username> profile only", "https://www.instagram.com/some_user/", false},
+		{"/accounts/login", "https://www.instagram.com/accounts/login/", false},
+
+		// Negative: confusable hosts that must NOT match (security-critical).
+		{"evilinstagram.com host", "https://evilinstagram.com/p/CXXXXX/", false},
+		{"instagram.com.evil.com host", "https://instagram.com.evil.com/p/CXXXXX/", false},
+		{"non-IG host with /p/ path", "https://example.com/p/CXXXXX/", false},
+
+		// Negative: non-IG hosts entirely.
+		{"youtube watch URL", "https://www.youtube.com/watch?v=abc123", false},
+		{"tiktok URL", "https://www.tiktok.com/@user/video/12345", false},
+
+		// Edge: parse errors must return false (not panic, not true).
+		{"malformed URL with IPv6 bracket", "http://[::1", false},
+		{"empty string", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsInstagramSinglePost(tt.rawURL); got != tt.want {
+				t.Errorf("IsInstagramSinglePost(%q) = %v, want %v", tt.rawURL, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsIGRateLimit covers the rate-limit detector used by the cookies
+// fallback retry and the cooldown wiring. Table-driven across the three
+// production IG error strings, wrapped errors (so retry logic detects
+// fmt.Errorf("%w") chains), and negative cases that must NOT trigger
+// cooldown (random go errors, nil, generic exit-status-1).
+func TestIsIGRateLimit(t *testing.T) {
+	// The three production strings we must detect. Sourced from yt-dlp's
+	// captured stderr surfaced by formatYtdlpError.
+	const (
+		ratelimitMsg = "rate-limit reached or login required"
+		http429Msg   = "HTTP Error 429"
+		loginReqMsg  = "login required"
+	)
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// Positive: bare matches against the three substring patterns.
+		{
+			"IG rate-limit string",
+			errors.New("ERROR: [Instagram] DXXX: Requested content is not available, rate-limit reached or login required"),
+			true,
+		},
+		{
+			"HTTP 429 from yt-dlp",
+			errors.New("ERROR: unable to download video data: HTTP Error 429: Too Many Requests"),
+			true,
+		},
+		{
+			"generic login required",
+			errors.New("ERROR: [Instagram] story: login required to view this story"),
+			true,
+		},
+
+		// Positive: wrapped errors. formatYtdlpError uses fmt.Errorf with %w
+		// in production, so the detector must walk the error chain (which
+		// err.Error() does implicitly because fmt.Errorf includes the wrapped
+		// message in the formatted string).
+		{
+			"wrapped IG rate-limit",
+			fmt.Errorf("download failed: %w", errors.New("rate-limit reached or login required")),
+			true,
+		},
+		{
+			"double-wrapped HTTP 429",
+			fmt.Errorf("layer 2: %w", fmt.Errorf("layer 1: %w", errors.New("HTTP Error 429"))),
+			true,
+		},
+		{
+			"formatYtdlpError-style wrap (mimics production)",
+			fmt.Errorf("%w - %s", errors.New("exit status 1"), "ERROR: [Instagram] DXXX: rate-limit reached or login required"),
+			true,
+		},
+
+		// Negative: nil err is the easy false case.
+		{"nil error", nil, false},
+
+		// Negative: generic exit-status / unrelated errors must NOT match.
+		{"generic exit status 1", errors.New("exit status 1"), false},
+		{"random go error", errors.New("connection refused"), false},
+		{"yt-dlp non-rate-limit stderr", fmt.Errorf("%w - %s", errors.New("exit status 1"), "ERROR: [generic] Unsupported URL"), false},
+		{"empty error message", errors.New(""), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isIGRateLimit(tt.err); got != tt.want {
+				t.Errorf("isIGRateLimit(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+
+	// Sanity: ensure each documented substring is independently detected,
+	// so adding/removing one constant in the helper trips this test.
+	t.Run("each documented substring is independently detected", func(t *testing.T) {
+		for _, sub := range []string{ratelimitMsg, http429Msg, loginReqMsg} {
+			if !isIGRateLimit(errors.New("prefix: " + sub + " :suffix")) {
+				t.Errorf("documented substring %q not detected by isIGRateLimit", sub)
+			}
+		}
+	})
+}
+
+// TestNoteIGRateLimit covers the cooldown stamp set by noteIGRateLimit and
+// how waitForIGSlot consumes it. Direct field manipulation lets us assert
+// timing windows without sleeping the full igCooldown (5min) in real time.
+func TestNoteIGRateLimit(t *testing.T) {
+	t.Run("noteIGRateLimit sets cooldown deadline approximately now+igCooldown", func(t *testing.T) {
+		d := &Downloader{}
+		before := time.Now()
+		d.noteIGRateLimit()
+		expected := before.Add(igCooldown)
+		drift := d.igCooldownUntil.Sub(expected)
+		if drift < -100*time.Millisecond || drift > 100*time.Millisecond {
+			t.Errorf("igCooldownUntil drift = %v, want within +/-100ms (expected=%v, got=%v)",
+				drift, expected, d.igCooldownUntil)
+		}
+	})
+
+	t.Run("waitForIGSlot honors active cooldown when minIGGap already elapsed", func(t *testing.T) {
+		d := &Downloader{}
+		// Gap already elapsed → minIGGap-only path would pass immediately.
+		d.igLastAt = time.Now().Add(-(minIGGap + 5*time.Second))
+		// But cooldown active with 400ms remaining must force a wait.
+		d.igCooldownUntil = time.Now().Add(400 * time.Millisecond)
+
+		ctx := context.Background()
+		before := time.Now()
+		err := d.waitForIGSlot(ctx, "https://instagram.com/p/abc/", nil)
+		elapsed := time.Since(before)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if elapsed < 300*time.Millisecond {
+			t.Errorf("expected wait ~400ms (cooldown), got %v (too short)", elapsed)
+		}
+		if elapsed > 2*time.Second {
+			t.Errorf("expected wait ~400ms (cooldown), got %v (too long)", elapsed)
+		}
+	})
+
+	t.Run("waitForIGSlot uses MAX of minIGGap-remaining and cooldown-remaining", func(t *testing.T) {
+		d := &Downloader{}
+		// minIGGap would require ~200ms more; cooldown requires ~600ms more.
+		// The cooldown remaining is longer, so it must win.
+		d.igLastAt = time.Now().Add(-(minIGGap - 200*time.Millisecond))
+		d.igCooldownUntil = time.Now().Add(600 * time.Millisecond)
+
+		ctx := context.Background()
+		before := time.Now()
+		err := d.waitForIGSlot(ctx, "https://instagram.com/p/abc/", nil)
+		elapsed := time.Since(before)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Should wait the longer of the two (~600ms), not the shorter (~200ms).
+		if elapsed < 500*time.Millisecond {
+			t.Errorf("expected wait ~600ms (cooldown wins), got %v (too short — only minIGGap honored?)", elapsed)
+		}
+		if elapsed > 2*time.Second {
+			t.Errorf("expected wait ~600ms (cooldown wins), got %v (too long)", elapsed)
+		}
+	})
+
+	t.Run("expired cooldown is ignored (falls back to minIGGap-only path)", func(t *testing.T) {
+		d := &Downloader{}
+		// Both gap elapsed AND cooldown already expired → fast path.
+		d.igLastAt = time.Now().Add(-(minIGGap + 5*time.Second))
+		d.igCooldownUntil = time.Now().Add(-10 * time.Second)
+
+		ctx := context.Background()
+		before := time.Now()
+		err := d.waitForIGSlot(ctx, "https://instagram.com/p/abc/", nil)
+		elapsed := time.Since(before)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if elapsed > fastPathBudget {
+			t.Errorf("expired cooldown caused unexpected wait of %v, want <%v", elapsed, fastPathBudget)
+		}
+	})
+
+	t.Run("non-IG URLs ignore cooldown entirely", func(t *testing.T) {
+		d := &Downloader{}
+		// Long active cooldown — non-IG URL must NOT honor it.
+		d.igCooldownUntil = time.Now().Add(1 * time.Hour)
+
+		ctx := context.Background()
+		before := time.Now()
+		err := d.waitForIGSlot(ctx, "https://youtube.com/watch?v=abc", nil)
+		elapsed := time.Since(before)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if elapsed > fastPathBudget {
+			t.Errorf("non-IG URL waited %v despite cooldown applying only to IG, want <%v", elapsed, fastPathBudget)
+		}
+	})
+
+	t.Run("second noteIGRateLimit within window slides the deadline forward", func(t *testing.T) {
+		d := &Downloader{}
+		d.noteIGRateLimit()
+		firstDeadline := d.igCooldownUntil
+
+		// Sleep enough that the second call's now() is measurably later than
+		// the first's, then verify the deadline moved with it.
+		time.Sleep(20 * time.Millisecond)
+		d.noteIGRateLimit()
+		secondDeadline := d.igCooldownUntil
+
+		if !secondDeadline.After(firstDeadline) {
+			t.Errorf("second noteIGRateLimit did not slide deadline forward: first=%v, second=%v",
+				firstDeadline, secondDeadline)
+		}
+		// Sanity: each call sets to now+igCooldown (not first+igCooldown +
+		// extra), so the drift between deadlines must roughly match the sleep
+		// (~20ms), NOT accumulate the full igCooldown twice.
+		drift := secondDeadline.Sub(firstDeadline)
+		if drift > 5*time.Second {
+			t.Errorf("deadline drift = %v, expected ~20ms (sliding window, not stacking)", drift)
+		}
+	})
+
+	t.Run("progress emission reflects cooldown-aware wait, not just minIGGap", func(t *testing.T) {
+		d := &Downloader{}
+		// minIGGap elapsed; cooldown forces a ~1s wait.
+		d.igLastAt = time.Now().Add(-(minIGGap + 5*time.Second))
+		d.igCooldownUntil = time.Now().Add(1 * time.Second)
+		r := &progressRecorder{}
+
+		ctx := context.Background()
+		err := d.waitForIGSlot(ctx, "https://instagram.com/p/abc/", r.cb)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		events := r.snapshot()
+		if len(events) != 1 {
+			t.Fatalf("expected 1 queued event, got %d: %+v", len(events), events)
+		}
+		if events[0].Phase != "queued" {
+			t.Errorf("expected Phase=queued, got %q", events[0].Phase)
+		}
+		// ETA must reflect ~1s (the cooldown remaining), not ~minIGGap.
+		// Parse the rounded duration back; tolerate "1s" or "2s" rounding.
+		eta, parseErr := time.ParseDuration(events[0].ETA)
+		if parseErr != nil {
+			t.Fatalf("unparseable ETA %q: %v", events[0].ETA, parseErr)
+		}
+		if eta < 500*time.Millisecond || eta > 3*time.Second {
+			t.Errorf("ETA=%v, expected ~1s (cooldown-aware), got %v — not minIGGap (%v)",
+				eta, eta, minIGGap)
+		}
+	})
+}
+
+// TestIGCooldownConstant locks the cooldown constant so accidental edits trip
+// the test. The value is load-bearing (operator-tuned for IG flag-recovery
+// window per plan).
+func TestIGCooldownConstant(t *testing.T) {
+	if igCooldown != 5*time.Minute {
+		t.Errorf("igCooldown = %v, want 5m", igCooldown)
+	}
+}
+
+// TestShouldRetryWithCookies pins the pure-logic decision used by
+// runWithCookieFallback to gate the cookies retry. The matrix covers the
+// four interesting combinations of (err is/isn't IG-rate-limit) × (cookies
+// path empty/non-empty) plus a nil-err sanity case.
+//
+// Behavior contract (per plan, Layer 1):
+//   - retry ONLY when the anonymous attempt failed AND we actually have
+//     cookies to retry with. Without cookies, retrying anonymously again
+//     would just repeat the same outcome — fail fast instead so the caller
+//     surfaces the original error to the user.
+//   - retry ONLY on IG-rate-limit / login-required errors. Generic network
+//     / extractor / unsupported-URL errors are not auth-fixable and would
+//     just waste an IG slot.
+func TestShouldRetryWithCookies(t *testing.T) {
+	const (
+		igRLMsg  = "rate-limit reached or login required"
+		genericMsg = "ERROR: [generic] Unsupported URL"
+	)
+
+	tests := []struct {
+		name        string
+		err         error
+		cookiesPath string
+		want        bool
+	}{
+		// Nil error: caller should not be calling this at all on success,
+		// but the helper must still return false defensively.
+		{"nil err, no cookies", nil, "", false},
+		{"nil err, with cookies", nil, "/path/cookies.txt", false},
+
+		// IG rate-limit + cookies: the one true-case. This is the path that
+		// runWithCookieFallback uses to trigger the cookies retry.
+		{"IG rate-limit + cookies path", errors.New(igRLMsg), "/path/cookies.txt", true},
+		{
+			"wrapped IG rate-limit + cookies path",
+			fmt.Errorf("download failed: %w", errors.New(igRLMsg)),
+			"/path/cookies.txt",
+			true,
+		},
+		{
+			"HTTP 429 + cookies path",
+			errors.New("HTTP Error 429: Too Many Requests"),
+			"/path/cookies.txt",
+			true,
+		},
+		{
+			"login required + cookies path",
+			errors.New("ERROR: [Instagram] story: login required"),
+			"/path/cookies.txt",
+			true,
+		},
+
+		// IG rate-limit but no cookies configured: retry is pointless.
+		// This is the bot-without-SUSHE_COOKIES case — anonymous-only mode
+		// must surface the error to the caller rather than spinning.
+		{"IG rate-limit, empty cookies", errors.New(igRLMsg), "", false},
+		{
+			"wrapped IG rate-limit, empty cookies",
+			fmt.Errorf("download failed: %w", errors.New(igRLMsg)),
+			"",
+			false,
+		},
+
+		// Non-IG errors: cookies don't help with extractor / network / URL
+		// problems, so no retry regardless of cookies-path state.
+		{"generic error + cookies path", errors.New(genericMsg), "/path/cookies.txt", false},
+		{"generic error, empty cookies", errors.New(genericMsg), "", false},
+		{"connection refused + cookies", errors.New("connection refused"), "/path/cookies.txt", false},
+		{"exit status 1 + cookies", errors.New("exit status 1"), "/path/cookies.txt", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRetryWithCookies(tt.err, tt.cookiesPath); got != tt.want {
+				t.Errorf("shouldRetryWithCookies(%v, %q) = %v, want %v",
+					tt.err, tt.cookiesPath, got, tt.want)
+			}
+		})
+	}
 }

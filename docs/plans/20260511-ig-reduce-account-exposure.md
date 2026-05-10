@@ -224,12 +224,12 @@ return result, err
 - Modify: `internal/downloader/downloader.go`
 - Modify: `internal/downloader/downloader_test.go`
 
-- [ ] add `isInstagramSinglePost(rawURL string) bool` to `downloader.go` near `waitForIGSlot`. Parses URL, host-matches IG (same pattern as gate), then path-matches `^/(p|reel|tv)/[^/]+/?`. Returns false on parse error or non-IG host.
-- [ ] add `isIGRateLimit(err error) bool` to `downloader.go`. Walks the wrapped error chain (errors.Unwrap or string-search the formatted message), returns true if any of `"rate-limit reached or login required"`, `"HTTP Error 429"`, or `"login required"` substrings present.
-- [ ] add `TestIsInstagramSinglePost` table-driven: positive cases (`/p/abc/`, `/reel/xyz`, `/tv/123/`, `https://www.instagram.com/p/abc/`, with query string `?igsh=...`); negative (`instagram.com/`, `/explore/`, `/u/name/saved/`, `/stories/...`, non-IG hosts); edge (parse error returns false; `evilinstagram.com/p/abc/` returns false — host mismatch).
-- [ ] add `TestIsIGRateLimit` table-driven: positive (the three exact production strings), negative (random go errors, nil error returns false, generic exit-status-1 error), edge (wrapped errors via `fmt.Errorf("...: %w", inner)`).
-- [ ] run `make test` — must pass before Task 2.
-- [ ] run `go vet ./... && go build ./...`.
+- [x] add `isInstagramSinglePost(rawURL string) bool` to `downloader.go` near `waitForIGSlot`. Parses URL, host-matches IG (same pattern as gate), then path-matches `^/(p|reel|tv)/[^/]+/?`. Returns false on parse error or non-IG host.
+- [x] add `isIGRateLimit(err error) bool` to `downloader.go`. Walks the wrapped error chain (errors.Unwrap or string-search the formatted message), returns true if any of `"rate-limit reached or login required"`, `"HTTP Error 429"`, or `"login required"` substrings present.
+- [x] add `TestIsInstagramSinglePost` table-driven: positive cases (`/p/abc/`, `/reel/xyz`, `/tv/123/`, `https://www.instagram.com/p/abc/`, with query string `?igsh=...`); negative (`instagram.com/`, `/explore/`, `/u/name/saved/`, `/stories/...`, non-IG hosts); edge (parse error returns false; `evilinstagram.com/p/abc/` returns false — host mismatch).
+- [x] add `TestIsIGRateLimit` table-driven: positive (the three exact production strings), negative (random go errors, nil error returns false, generic exit-status-1 error), edge (wrapped errors via `fmt.Errorf("...: %w", inner)`).
+- [x] run `make test` — must pass before Task 2.
+- [x] run `go vet ./... && go build ./...`.
 
 ### Task 2: IG-specific extractor args (Layer 0) + bump minIGGap
 
@@ -237,17 +237,17 @@ return result, err
 - Modify: `internal/downloader/downloader.go`
 - Modify: `internal/downloader/downloader_test.go`
 
-- [ ] extract the IG-host-match logic from `waitForIGSlot` into a free function `isInstagramHost(rawURL string) bool` so the gate AND the new args helper share one source of truth. (`waitForIGSlot` calls it internally; behavior unchanged.)
-- [ ] add `const igIosAppID = "124024574287414"` and `const igIosUA = "Instagram 339.0.0.12.95 (iPhone16,1; iOS 18_2; en_US; en_US; scale=3.00; gamut=normal; 1179x2556) AppleWebKit/420+"` near the other yt-dlp constants.
-- [ ] add `igExtractorArgs(rawURL string) []string` returning `[]string{"--extractor-args", "instagram:app_id=" + igIosAppID, "--user-agent", igIosUA, "--retries", "1", "--fragment-retries", "1"}` for IG URLs (via `isInstagramHost`), `nil` otherwise. Returns a fresh slice each call (consistent with `cookieArgs` / `throttleArgs`).
-- [ ] wire `igExtractorArgs(url)` into all three yt-dlp invocation sites in `DownloadWithProgress`, `GetPlaylistInfo`, `DownloadPlaylistVideo`. Order: append AFTER `throttleArgs()` and `cookieArgs(...)` so the IG-specific UA / retries / fragment-retries override the desktop defaults via yt-dlp's last-wins arg parsing.
-- [ ] bump `minIGGap` from `8 * time.Second` to `15 * time.Second`.
-- [ ] add `TestIgExtractorArgs` table-driven: IG URL returns the expected slice (fresh each call, asserts `--extractor-args` value, iOS UA, `--retries 1`, `--fragment-retries 1`); non-IG returns nil.
-- [ ] add `TestIgArgsOverrideThrottle` — full args-order integration test that mirrors what call sites build: `args := append(throttleArgs(), cookieArgs("")...); args = append(args, igExtractorArgs(igURL)...)`. Asserts: (a) `--user-agent` appears exactly twice, with the iOS UA literal LAST; (b) `--retries` appears twice with `"1"` LAST; (c) `--fragment-retries` appears twice with `"1"` LAST; (d) `--extractor-args "instagram:app_id=124024574287414"` is present. Also a non-IG case asserting exactly one `--user-agent` / `--retries` / `--fragment-retries` pair (the throttle defaults). This anchors the load-bearing "last-wins" invariant in tests so future arg-order refactors can't silently break Layer 0.
-- [ ] add `TestIsInstagramHost` table-driven (since we extracted it): `instagram.com`, `www.instagram.com`, `m.instagram.com` true; `evilinstagram.com`, `youtube.com`, `instagram.com.evil.com` false.
-- [ ] verify existing `TestWaitForIGSlot` still passes after the host-match extraction (no behavior change expected).
-- [ ] update `TestThrottleArgs` if needed — throttleArgs unchanged in this task, but tests should be re-run.
-- [ ] run `make test` — must pass before Task 3.
+- [x] extract the IG-host-match logic from `waitForIGSlot` into a free function `isInstagramHost(rawURL string) bool` so the gate AND the new args helper share one source of truth. (`waitForIGSlot` calls it internally; behavior unchanged.)
+- [x] add `const igIosAppID = "124024574287414"` and `const igIosUA = "Instagram 339.0.0.12.95 (iPhone16,1; iOS 18_2; en_US; en_US; scale=3.00; gamut=normal; 1179x2556) AppleWebKit/420+"` near the other yt-dlp constants.
+- [x] add `igExtractorArgs(rawURL string) []string` returning `[]string{"--extractor-args", "instagram:app_id=" + igIosAppID, "--user-agent", igIosUA, "--retries", "1", "--fragment-retries", "1"}` for IG URLs (via `isInstagramHost`), `nil` otherwise. Returns a fresh slice each call (consistent with `cookieArgs` / `throttleArgs`).
+- [x] wire `igExtractorArgs(url)` into all three yt-dlp invocation sites in `DownloadWithProgress`, `GetPlaylistInfo`, `DownloadPlaylistVideo`. Order: append AFTER `throttleArgs()` and `cookieArgs(...)` so the IG-specific UA / retries / fragment-retries override the desktop defaults via yt-dlp's last-wins arg parsing.
+- [x] bump `minIGGap` from `8 * time.Second` to `15 * time.Second`.
+- [x] add `TestIgExtractorArgs` table-driven: IG URL returns the expected slice (fresh each call, asserts `--extractor-args` value, iOS UA, `--retries 1`, `--fragment-retries 1`); non-IG returns nil.
+- [x] add `TestIgArgsOverrideThrottle` — full args-order integration test that mirrors what call sites build: `args := append(throttleArgs(), cookieArgs("")...); args = append(args, igExtractorArgs(igURL)...)`. Asserts: (a) `--user-agent` appears exactly twice, with the iOS UA literal LAST; (b) `--retries` appears twice with `"1"` LAST; (c) `--fragment-retries` appears twice with `"1"` LAST; (d) `--extractor-args "instagram:app_id=124024574287414"` is present. Also a non-IG case asserting exactly one `--user-agent` / `--retries` / `--fragment-retries` pair (the throttle defaults). This anchors the load-bearing "last-wins" invariant in tests so future arg-order refactors can't silently break Layer 0.
+- [x] add `TestIsInstagramHost` table-driven (since we extracted it): `instagram.com`, `www.instagram.com`, `m.instagram.com` true; `evilinstagram.com`, `youtube.com`, `instagram.com.evil.com` false.
+- [x] verify existing `TestWaitForIGSlot` still passes after the host-match extraction (no behavior change expected).
+- [x] update `TestThrottleArgs` if needed — throttleArgs unchanged in this task, but tests should be re-run.
+- [x] run `make test` — must pass before Task 3.
 
 ### Task 3: Add cooldown-on-rate-limit to waitForIGSlot
 
@@ -255,17 +255,17 @@ return result, err
 - Modify: `internal/downloader/downloader.go`
 - Modify: `internal/downloader/downloader_test.go`
 
-- [ ] add `igCooldownUntil time.Time` field on `Downloader` struct (next to `igLastAt`).
-- [ ] add `const igCooldown = 5 * time.Minute` near `minIGGap`.
-- [ ] add `(d *Downloader) noteIGRateLimit()` method: locks `d.igMu`, sets `d.igCooldownUntil = time.Now().Add(igCooldown)`. Idempotent — multiple consecutive rate-limit responses just refresh the deadline (effectively a sliding window of 5 min from last bad signal, which is what we want).
-- [ ] extend `waitForIGSlot`'s wait calculation to take MAX of `(minIGGap - time.Since(d.igLastAt))` AND `time.Until(d.igCooldownUntil)`. The same projected-stamp + lock-narrow + sleep-outside-lock pattern stays.
-- [ ] update the queued progress emission to use the cooldown-aware remaining duration so user sees the actual wait, not just minIGGap.
-- [ ] add tests for cooldown:
+- [x] add `igCooldownUntil time.Time` field on `Downloader` struct (next to `igLastAt`).
+- [x] add `const igCooldown = 5 * time.Minute` near `minIGGap`.
+- [x] add `(d *Downloader) noteIGRateLimit()` method: locks `d.igMu`, sets `d.igCooldownUntil = time.Now().Add(igCooldown)`. Idempotent — multiple consecutive rate-limit responses just refresh the deadline (effectively a sliding window of 5 min from last bad signal, which is what we want).
+- [x] extend `waitForIGSlot`'s wait calculation to take MAX of `(minIGGap - time.Since(d.igLastAt))` AND `time.Until(d.igCooldownUntil)`. The same projected-stamp + lock-narrow + sleep-outside-lock pattern stays.
+- [x] update the queued progress emission to use the cooldown-aware remaining duration so user sees the actual wait, not just minIGGap.
+- [x] add tests for cooldown:
   - `noteIGRateLimit` sets the deadline; subsequent `waitForIGSlot` waits the cooldown remaining (not just minIGGap), validates via direct field manipulation + tolerance window.
   - cooldown elapses → next call passes through normally.
   - non-IG URLs ignore cooldown (return immediately even if cooldown active — cooldown is IG-specific).
   - second `noteIGRateLimit` within the cooldown window extends the deadline (sliding behavior).
-- [ ] run `make test` — must pass before Task 4.
+- [x] run `make test` — must pass before Task 4.
 
 ### Task 4: Skip IsPlaylist preflight for single-post URLs
 
@@ -274,12 +274,12 @@ return result, err
 - Modify: `internal/engine/engine_test.go`
 - (also: any test that relies on IsPlaylist always calling GetPlaylistInfo for IG URLs)
 
-- [ ] in `engine.IsPlaylist`, before calling `e.downloader.GetPlaylistInfo`, call `downloader.IsInstagramSinglePost(url)` (export the helper from Task 1 if needed) and short-circuit `return false, nil, nil` for matches.
-- [ ] add tests:
+- [x] in `engine.IsPlaylist`, before calling `e.downloader.GetPlaylistInfo`, call `downloader.IsInstagramSinglePost(url)` (export the helper from Task 1 if needed) and short-circuit `return false, nil, nil` for matches.
+- [x] add tests:
   - IG single-post URL (`/reel/...`) → IsPlaylist returns `(false, nil, nil)` without invoking the downloader. Use a downloader stub or check that no GetPlaylistInfo error is returned even when the test would normally hit yt-dlp.
   - Non-single-post IG URL (`/explore/`) → falls through to existing path.
   - Non-IG URL → falls through to existing path.
-- [ ] run `make test` — must pass before Task 5.
+- [x] run `make test` — must pass before Task 5.
 
 ### Task 5: Try-anonymous-first in download methods + cooldown wiring
 
@@ -287,29 +287,29 @@ return result, err
 - Modify: `internal/downloader/downloader.go`
 - Modify: `internal/downloader/downloader_test.go`
 
-- [ ] refactor cookies arg out of the unconditional `cookieArgs(d.cookiesPath)` prepend in `DownloadWithProgress` and `DownloadPlaylistVideo` arg builders. Build args without cookies first; cookies passed separately to a new internal helper.
-- [ ] introduce small internal helper `(d *Downloader) runWithCookieFallback(ctx, baseArgs, progressCb)` that:
+- [x] refactor cookies arg out of the unconditional `cookieArgs(d.cookiesPath)` prepend in `DownloadWithProgress` and `DownloadPlaylistVideo` arg builders. Build args without cookies first; cookies passed separately to a new internal helper.
+- [x] introduce small internal helper `(d *Downloader) runWithCookieFallback(ctx, baseArgs, progressCb)` that:
   1. Runs yt-dlp with `cookieArgs("")` (anonymous).
   2. If err and `isIGRateLimit(err)` and `d.cookiesPath != ""` → retries with `cookieArgs(d.cookiesPath)`.
   3. If retry also fails (or initial fail wasn't IG-rate-limit) → returns the error AND calls `d.noteIGRateLimit()` if `isIGRateLimit(err)` is true (so subsequent goroutines back off).
-- [ ] wire `DownloadWithProgress` and `DownloadPlaylistVideo` to use `runWithCookieFallback`.
-- [ ] keep `GetPlaylistInfo` using cookies up front — it's only called for unusual playlist URLs after Layer 2 short-circuits the common case. Add `noteIGRateLimit` call on its error path too.
-- [ ] extract pure-logic helper `shouldRetryWithCookies(err error, cookiesPath string) bool` that returns `isIGRateLimit(err) && cookiesPath != ""`. Five lines of code; unit-testable without exec.Cmd. The retry loop in `runWithCookieFallback` calls it instead of inlining the boolean.
-- [ ] add `TestShouldRetryWithCookies` table-driven: nil err → false; non-IG err → false; IG-rate-limit err with empty cookies → false; IG-rate-limit err with cookies path set → true.
-- [ ] run `make test` — must pass before Task 6.
+- [x] wire `DownloadWithProgress` and `DownloadPlaylistVideo` to use `runWithCookieFallback`.
+- [x] keep `GetPlaylistInfo` using cookies up front — it's only called for unusual playlist URLs after Layer 2 short-circuits the common case. Add `noteIGRateLimit` call on its error path too.
+- [x] extract pure-logic helper `shouldRetryWithCookies(err error, cookiesPath string) bool` that returns `isIGRateLimit(err) && cookiesPath != ""`. Five lines of code; unit-testable without exec.Cmd. The retry loop in `runWithCookieFallback` calls it instead of inlining the boolean.
+- [x] add `TestShouldRetryWithCookies` table-driven: nil err → false; non-IG err → false; IG-rate-limit err with empty cookies → false; IG-rate-limit err with cookies path set → true.
+- [x] run `make test` — must pass before Task 6.
 
 ### Task 6: Verify acceptance criteria
 
-- [ ] `make test` clean (existing + all new tests).
-- [ ] `go vet ./...` clean, `go build ./...` clean.
-- [ ] read the diff and confirm:
+- [x] `make test` clean (existing + all new tests).
+- [x] `go vet ./...` clean, `go build ./...` clean.
+- [x] read the diff and confirm:
   - `igExtractorArgs(url)` is appended at all three yt-dlp invocation sites and overrides UA / retries for IG only.
-  - `minIGGap = 12 * time.Second` (was 8s).
+  - `minIGGap = 15 * time.Second` (was 8s — Task 2 spec; bumped to 15s per the rationale in lines 99-102 of downloader.go, NOT 12s as the original Task 6 wording suggested).
   - `DownloadWithProgress` and `DownloadPlaylistVideo` call yt-dlp ANONYMOUSLY first; only retry with cookies on `isIGRateLimit(err)`.
   - `GetPlaylistInfo` is NOT called by `IsPlaylist` for `/p/`, `/reel/`, `/tv/` IG URLs.
   - `noteIGRateLimit()` is called on every IG rate-limit error path.
   - `waitForIGSlot` honors `igCooldownUntil` in addition to `minIGGap`.
-- [ ] confirm no regression for non-IG URLs (YouTube, Twitter, etc.):
+- [x] confirm no regression for non-IG URLs (YouTube, Twitter, etc.):
   - `igExtractorArgs(non-IG-URL)` returns nil → no UA override, retries=3 stays from throttleArgs.
   - They should not enter any of the new code paths.
 

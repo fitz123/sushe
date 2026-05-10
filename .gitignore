@@ -37,7 +37,8 @@ sushe
 .ralphex/progress/
 .ralphex/worktrees/
 
-# Sensitive operator files
-*-cookies.txt
+# Sensitive operator files (broad — anything with "cookies" or "cookie" in the name)
+*cookies*.txt
+*cookie*.txt
 /cookies.txt
 sushe-operator*

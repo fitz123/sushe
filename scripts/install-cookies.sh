@@ -17,7 +17,7 @@
 # Idempotent: re-run on cookie session expiry to refresh the file and restart.
 #
 # Usage:
-#   ./scripts/install-cookies.sh                       # uses instagram-cookies.txt
+#   ./scripts/install-cookies.sh                       # uses www.instagram.com_cookies.txt
 #   ./scripts/install-cookies.sh path/to/cookies.txt   # explicit source path
 
 set -euo pipefail
@@ -30,7 +30,7 @@ source "$REPO_DIR/.env"
 
 : "${SSH_HOST:?SSH_HOST not set in .env}"
 
-LOCAL_COOKIES="${1:-$REPO_DIR/instagram-cookies.txt}"
+LOCAL_COOKIES="${1:-$REPO_DIR/www.instagram.com_cookies.txt}"
 REMOTE_COOKIES_PATH="/home/sushe/.config/sushe/cookies.txt"
 
 # Step 1: validate local cookies file

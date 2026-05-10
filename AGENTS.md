@@ -374,7 +374,7 @@ When the `SUSHE_COOKIES` env var is set on the server, the bot passes `--cookies
 
 `make deploy` (i.e. `scripts/deploy.sh`) handles the full setup, including:
 - creating `/home/sushe/.config/sushe/` (mode 0700, owner sushe)
-- transferring `instagram-cookies.txt` from the repo root if it exists locally (mode 0600)
+- transferring `www.instagram.com_cookies.txt` from the repo root if it exists locally (mode 0600)
 - writing `/etc/systemd/system/sushe.service` with `Environment=SUSHE_COOKIES=...` and `ReadWritePaths=.../.config/sushe` inline
 - removing any obsolete `cookies.conf` drop-in left over from earlier flows
 - `daemon-reload` + restart
@@ -389,7 +389,7 @@ Instagram cookies typically last weeks-to-months. When the session expires the b
 ./scripts/install-cookies.sh
 ```
 
-The script uploads the local `instagram-cookies.txt` to `~/.config/sushe/cookies.txt`, pre-flights `Environment` + `ReadWritePaths` on the server (aborts with a helpful message pointing at `make deploy` if the unit is missing the required directives), restarts via the allowlisted `sudo systemctl restart sushe`, and verifies the live process picked up the new env via `/proc/<MainPID>/environ`.
+The script uploads the local `www.instagram.com_cookies.txt` to `~/.config/sushe/cookies.txt`, pre-flights `Environment` + `ReadWritePaths` on the server (aborts with a helpful message pointing at `make deploy` if the unit is missing the required directives), restarts via the allowlisted `sudo systemctl restart sushe`, and verifies the live process picked up the new env via `/proc/<MainPID>/environ`.
 
 **Hygiene:** use a dedicated Instagram account for the bot (not your personal one) to avoid the main account being flagged for unusual access patterns.
 

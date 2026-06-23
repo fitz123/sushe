@@ -56,9 +56,15 @@ build_telegram_bot_api() {
         return 0
     fi
 
-    log "Building with Docker (this may take 5-10 minutes on first run)..."
+    local idle_timeout="${TELEGRAM_BOT_API_IDLE_TIMEOUT:-800}"
+    local build_jobs="${TELEGRAM_BOT_API_BUILD_JOBS:-1}"
+    local platform="${TELEGRAM_BOT_API_PLATFORM:-linux/amd64}"
+    [[ "$idle_timeout" =~ ^[0-9]+$ ]] || error "TELEGRAM_BOT_API_IDLE_TIMEOUT must be numeric"
+    [[ "$build_jobs" =~ ^[0-9]+$ ]] || error "TELEGRAM_BOT_API_BUILD_JOBS must be numeric"
 
-    docker run --rm -v "$BIN_DIR:/output" ubuntu:22.04 bash -c '
+    log "Building with Docker (platform=${platform}, IDLE_TIMEOUT=${idle_timeout}s, jobs=${build_jobs})..."
+
+    docker run --rm --platform "$platform" -e IDLE_TIMEOUT="$idle_timeout" -e BUILD_JOBS="$build_jobs" -v "$BIN_DIR:/output" ubuntu:22.04 bash -c '
 set -e
 apt-get update -qq
 apt-get install -y -qq make git zlib1g-dev libssl-dev gperf cmake g++ > /dev/null
@@ -66,9 +72,11 @@ apt-get install -y -qq make git zlib1g-dev libssl-dev gperf cmake g++ > /dev/nul
 cd /tmp
 git clone --recursive -q https://github.com/tdlib/telegram-bot-api.git
 cd telegram-bot-api
+sed -i -E "s/(static constexpr td::int32 IDLE_TIMEOUT = )[0-9]+;/\1${IDLE_TIMEOUT};/" telegram-bot-api/HttpServer.h
+grep "IDLE_TIMEOUT = ${IDLE_TIMEOUT};" telegram-bot-api/HttpServer.h
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release .. > /dev/null
-cmake --build . --target telegram-bot-api -j4
+cmake --build . --target telegram-bot-api -j"${BUILD_JOBS}"
 
 cp /tmp/telegram-bot-api/build/telegram-bot-api /output/
 '

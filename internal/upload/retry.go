@@ -3,6 +3,7 @@ package upload
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/fitz123/sushe/internal/logger"
@@ -10,6 +11,16 @@ import (
 )
 
 const maxRetries = 3
+
+var telegramBotTokenPattern = regexp.MustCompile(`bot[0-9]+:[A-Za-z0-9_-]+`)
+
+// SanitizeError redacts secrets from errors before they are logged or shown to users.
+func SanitizeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(telegramBotTokenPattern.ReplaceAllString(err.Error(), "bot<redacted-token>"))
+}
 
 // SendWithRetry wraps bot.Send with 429/FloodError retry logic.
 // On tele.FloodError, it sleeps for RetryAfter seconds and retries up to maxRetries times.
@@ -30,7 +41,7 @@ func SendWithRetry(bot *tele.Bot, to tele.Recipient, what interface{}, opts ...i
 			continue
 		}
 
-		return nil, err
+		return nil, SanitizeError(err)
 	}
 
 	return nil, fmt.Errorf("max retries (%d) exceeded for Telegram upload", maxRetries)

@@ -345,8 +345,25 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 		Streaming: true,
 	}
 
+	logger.Info("Starting video upload",
+		"title", result.Title,
+		"file", result.FileName,
+		"size", result.FileSize,
+		"split", false,
+		"user", c.Sender().Username,
+	)
+	started := time.Now()
 	_, err := upload.SendWithRetry(bs.bot, c.Chat(), video, sendOpts)
+	elapsed := time.Since(started)
 	if err != nil {
+		logger.Error("Video upload failed",
+			"title", result.Title,
+			"file", result.FileName,
+			"size", result.FileSize,
+			"elapsed_seconds", elapsed.Seconds(),
+			"throughput_mib_s", upload.ThroughputMiBPerSecond(result.FileSize, elapsed),
+			"error", err,
+		)
 		bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to upload: %v", err))
 		return err
 	}
@@ -356,6 +373,8 @@ func (bs *BotService) uploadSingleVideo(c tele.Context, statusMsg *tele.Message,
 	logger.Info("Successfully processed video",
 		"title", result.Title,
 		"size", result.FileSize,
+		"elapsed_seconds", elapsed.Seconds(),
+		"throughput_mib_s", upload.ThroughputMiBPerSecond(result.FileSize, elapsed),
 		"user", c.Sender().Username,
 	)
 
@@ -391,8 +410,28 @@ func (bs *BotService) uploadSplitVideo(c tele.Context, statusMsg *tele.Message, 
 			opts.ReplyTo = prevMsg
 		}
 
+		logger.Info("Starting split video part upload",
+			"title", result.Title,
+			"file", partFileName,
+			"part", partNum,
+			"total", totalParts,
+			"size", part.FileSize,
+			"user", c.Sender().Username,
+		)
+		started := time.Now()
 		sentMsg, err := upload.SendWithRetry(bs.bot, c.Chat(), video, opts)
+		elapsed := time.Since(started)
 		if err != nil {
+			logger.Error("Split video part upload failed",
+				"title", result.Title,
+				"file", partFileName,
+				"part", partNum,
+				"total", totalParts,
+				"size", part.FileSize,
+				"elapsed_seconds", elapsed.Seconds(),
+				"throughput_mib_s", upload.ThroughputMiBPerSecond(part.FileSize, elapsed),
+				"error", err,
+			)
 			bs.bot.Edit(statusMsg, fmt.Sprintf("Failed to upload part %d: %v", partNum, err))
 			return err
 		}
@@ -403,6 +442,8 @@ func (bs *BotService) uploadSplitVideo(c tele.Context, statusMsg *tele.Message, 
 			"part", partNum,
 			"total", totalParts,
 			"size", part.FileSize,
+			"elapsed_seconds", elapsed.Seconds(),
+			"throughput_mib_s", upload.ThroughputMiBPerSecond(part.FileSize, elapsed),
 		)
 	}
 
@@ -441,11 +482,40 @@ func (bs *BotService) uploadPlaylistSingleVideo(c tele.Context, statusMsg *tele.
 		opts.ReplyTo = replyTo
 	}
 
+	logger.Info("Starting playlist video upload",
+		"title", result.Title,
+		"file", result.FileName,
+		"video", videoNum,
+		"totalVideos", totalVideos,
+		"size", result.FileSize,
+		"user", c.Sender().Username,
+	)
+	started := time.Now()
 	sentMsg, err := upload.SendWithRetry(bs.bot, c.Chat(), video, opts)
+	elapsed := time.Since(started)
 	if err != nil {
+		logger.Error("Playlist video upload failed",
+			"title", result.Title,
+			"file", result.FileName,
+			"video", videoNum,
+			"totalVideos", totalVideos,
+			"size", result.FileSize,
+			"elapsed_seconds", elapsed.Seconds(),
+			"throughput_mib_s", upload.ThroughputMiBPerSecond(result.FileSize, elapsed),
+			"error", err,
+		)
 		return nil, fmt.Errorf("failed to upload: %w", err)
 	}
 
+	logger.Info("Playlist video upload complete",
+		"title", result.Title,
+		"file", result.FileName,
+		"video", videoNum,
+		"totalVideos", totalVideos,
+		"size", result.FileSize,
+		"elapsed_seconds", elapsed.Seconds(),
+		"throughput_mib_s", upload.ThroughputMiBPerSecond(result.FileSize, elapsed),
+	)
 	return sentMsg, nil
 }
 
@@ -486,8 +556,32 @@ func (bs *BotService) uploadPlaylistSplitVideo(c tele.Context, statusMsg *tele.M
 			}
 		}
 
+		logger.Info("Starting playlist split video part upload",
+			"title", result.Title,
+			"file", partFileName,
+			"video", videoNum,
+			"totalVideos", totalVideos,
+			"part", partNum,
+			"totalParts", totalParts,
+			"size", part.FileSize,
+			"user", c.Sender().Username,
+		)
+		started := time.Now()
 		sentMsg, err := upload.SendWithRetry(bs.bot, c.Chat(), video, opts)
+		elapsed := time.Since(started)
 		if err != nil {
+			logger.Error("Playlist split video part upload failed",
+				"title", result.Title,
+				"file", partFileName,
+				"video", videoNum,
+				"totalVideos", totalVideos,
+				"part", partNum,
+				"totalParts", totalParts,
+				"size", part.FileSize,
+				"elapsed_seconds", elapsed.Seconds(),
+				"throughput_mib_s", upload.ThroughputMiBPerSecond(part.FileSize, elapsed),
+				"error", err,
+			)
 			return lastPartMsg, fmt.Errorf("failed to upload part %d: %v", partNum, err)
 		}
 
@@ -501,6 +595,8 @@ func (bs *BotService) uploadPlaylistSplitVideo(c tele.Context, statusMsg *tele.M
 			"part", partNum,
 			"totalParts", totalParts,
 			"size", part.FileSize,
+			"elapsed_seconds", elapsed.Seconds(),
+			"throughput_mib_s", upload.ThroughputMiBPerSecond(part.FileSize, elapsed),
 		)
 	}
 

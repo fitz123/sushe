@@ -315,11 +315,32 @@ func (s *APIService) uploadSingleFile(result *engine.ProcessResult, filePath, fi
 		Streaming: true,
 	}
 
+	logger.Info("Starting video upload",
+		"file", fileName,
+		"size", result.FileSize,
+		"split", false,
+	)
+	started := time.Now()
 	msg, err := upload.SendWithRetry(s.bot, recipient, video, opts)
+	elapsed := time.Since(started)
 	if err != nil {
+		logger.Error("Video upload failed",
+			"file", fileName,
+			"size", result.FileSize,
+			"elapsed_seconds", elapsed.Seconds(),
+			"throughput_mib_s", upload.ThroughputMiBPerSecond(result.FileSize, elapsed),
+			"error", err,
+		)
 		return 0, err
 	}
 
+	logger.Info("Video upload complete",
+		"file", fileName,
+		"size", result.FileSize,
+		"elapsed_seconds", elapsed.Seconds(),
+		"throughput_mib_s", upload.ThroughputMiBPerSecond(result.FileSize, elapsed),
+		"message_id", msg.ID,
+	)
 	return msg.ID, nil
 }
 
@@ -351,11 +372,37 @@ func (s *APIService) uploadSplitParts(result *engine.ProcessResult, recipient te
 			opts.ReplyTo = prevMsg
 		}
 
+		logger.Info("Starting split video part upload",
+			"file", partFileName,
+			"part", part.PartNum,
+			"total_parts", len(result.Parts),
+			"size", part.FileSize,
+		)
+		started := time.Now()
 		msg, err := upload.SendWithRetry(s.bot, recipient, video, opts)
+		elapsed := time.Since(started)
 		if err != nil {
+			logger.Error("Split video part upload failed",
+				"file", partFileName,
+				"part", part.PartNum,
+				"total_parts", len(result.Parts),
+				"size", part.FileSize,
+				"elapsed_seconds", elapsed.Seconds(),
+				"throughput_mib_s", upload.ThroughputMiBPerSecond(part.FileSize, elapsed),
+				"error", err,
+			)
 			return firstMsgID, fmt.Errorf("failed to upload part %d: %w", part.PartNum, err)
 		}
 
+		logger.Info("Split video part upload complete",
+			"file", partFileName,
+			"part", part.PartNum,
+			"total_parts", len(result.Parts),
+			"size", part.FileSize,
+			"elapsed_seconds", elapsed.Seconds(),
+			"throughput_mib_s", upload.ThroughputMiBPerSecond(part.FileSize, elapsed),
+			"message_id", msg.ID,
+		)
 		if part.PartNum == 1 {
 			firstMsgID = msg.ID
 		}
@@ -376,4 +423,3 @@ func writeJSON(w http.ResponseWriter, flusher http.Flusher, v interface{}) {
 	w.Write([]byte("\n"))
 	flusher.Flush()
 }
-

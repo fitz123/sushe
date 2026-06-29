@@ -15,10 +15,16 @@ if [[ -f "$BIN_DIR/telegram-bot-api" ]]; then
     exit 0
 fi
 
-echo "Building telegram-bot-api for Linux using Docker..."
+IDLE_TIMEOUT="${TELEGRAM_BOT_API_IDLE_TIMEOUT:-800}"
+BUILD_JOBS="${TELEGRAM_BOT_API_BUILD_JOBS:-1}"
+PLATFORM="${TELEGRAM_BOT_API_PLATFORM:-linux/amd64}"
+[[ "$IDLE_TIMEOUT" =~ ^[0-9]+$ ]] || { echo "TELEGRAM_BOT_API_IDLE_TIMEOUT must be numeric" >&2; exit 1; }
+[[ "$BUILD_JOBS" =~ ^[0-9]+$ ]] || { echo "TELEGRAM_BOT_API_BUILD_JOBS must be numeric" >&2; exit 1; }
+
+echo "Building telegram-bot-api for Linux using Docker (platform=${PLATFORM}, IDLE_TIMEOUT=${IDLE_TIMEOUT}s, jobs=${BUILD_JOBS})..."
 
 # Use a multi-stage Docker build
-docker run --rm -v "$BIN_DIR:/output" ubuntu:22.04 bash -c '
+docker run --rm --platform "$PLATFORM" -e IDLE_TIMEOUT="$IDLE_TIMEOUT" -e BUILD_JOBS="$BUILD_JOBS" -v "$BIN_DIR:/output" ubuntu:22.04 bash -c '
 set -e
 apt-get update
 apt-get install -y make git zlib1g-dev libssl-dev gperf cmake g++ curl
@@ -26,9 +32,11 @@ apt-get install -y make git zlib1g-dev libssl-dev gperf cmake g++ curl
 cd /tmp
 git clone --recursive https://github.com/tdlib/telegram-bot-api.git
 cd telegram-bot-api
+sed -i -E "s/(static constexpr td::int32 IDLE_TIMEOUT = )[0-9]+;/\1${IDLE_TIMEOUT};/" telegram-bot-api/HttpServer.h
+grep "IDLE_TIMEOUT = ${IDLE_TIMEOUT};" telegram-bot-api/HttpServer.h
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . --target telegram-bot-api -j$(nproc)
+cmake --build . --target telegram-bot-api -j"${BUILD_JOBS}"
 
 cp /tmp/telegram-bot-api/build/telegram-bot-api /output/
 echo "Build complete!"

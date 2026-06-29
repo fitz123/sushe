@@ -1,6 +1,7 @@
 package upload
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,6 +10,18 @@ import (
 // TestSendWithRetryConstants verifies the retry configuration
 func TestSendWithRetryConstants(t *testing.T) {
 	assert.Equal(t, 3, maxRetries, "maxRetries should be 3")
+}
+
+func TestSanitizeErrorRedactsTelegramBotToken(t *testing.T) {
+	err := errors.New(`telebot: Post "http://localhost:8081/bot1234567890:AAH4secret_token-value/sendVideo": EOF`)
+
+	sanitized := SanitizeError(err)
+
+	assert.Equal(t, `telebot: Post "http://localhost:8081/bot<redacted-token>/sendVideo": EOF`, sanitized.Error())
+}
+
+func TestSanitizeErrorNil(t *testing.T) {
+	assert.NoError(t, SanitizeError(nil))
 }
 
 // Note: Full integration testing of SendWithRetry requires a mock telebot.Bot,

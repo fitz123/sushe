@@ -1,5 +1,4 @@
 # Ralphex config for sushe bot
-max_iterations = 10
 branch_prefix = ralphex/
 
 # Claude Code args

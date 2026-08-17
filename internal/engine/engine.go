@@ -76,10 +76,16 @@ func (e *Engine) Process(ctx context.Context, url string, progressCb ProgressCal
 
 // ProcessPlaylist downloads and processes all videos in a playlist.
 // Returns a slice of ProcessResults. Failed individual videos are logged and skipped.
-func (e *Engine) ProcessPlaylist(ctx context.Context, url string, progressCb func(videoNum, totalVideos int, phase string, percent float64)) ([]*ProcessResult, error) {
-	info, err := e.downloader.GetPlaylistInfo(ctx, url)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get playlist info: %w", err)
+//
+// info is REQUIRED — callers already obtained it from IsPlaylist; reusing it
+// here avoids a second yt-dlp metadata fetch per call. For Instagram /p/
+// carousels in particular, the second metadata fetch can fail with rate-limit
+// even though the first one (in IsPlaylist) succeeded, so passing the
+// pre-fetched info eliminates that failure mode by design. Passing nil is a
+// programming error and is rejected explicitly.
+func (e *Engine) ProcessPlaylist(ctx context.Context, url string, info *downloader.PlaylistInfo, progressCb func(videoNum, totalVideos int, phase string, percent float64)) ([]*ProcessResult, error) {
+	if info == nil {
+		return nil, fmt.Errorf("ProcessPlaylist: info is required (caller must pass the value returned by IsPlaylist)")
 	}
 
 	var results []*ProcessResult
@@ -161,7 +167,21 @@ func (e *Engine) ProcessPlaylist(ctx context.Context, url string, progressCb fun
 }
 
 // IsPlaylist checks if a URL is a playlist and returns playlist info if so.
+//
+// For Instagram URLs that match the guaranteed-single-video pattern (/reel/
+// or /tv/), skip the yt-dlp metadata preflight entirely — these URLs are
+// syntactically guaranteed to be single videos, so calling GetPlaylistInfo
+// would double the IG-extractor signal for the common case and accelerate
+// account flagging. `/p/` URLs are intentionally EXCLUDED from this
+// short-circuit because Instagram serves both single posts and carousel /
+// sidecar posts (multiple media items) under `/p/`; treating them all as
+// single-video would silently drop carousel items past the first. See the
+// IG account-exposure reduction plan (Layer 2) in docs/plans/completed/
+// for the rationale.
 func (e *Engine) IsPlaylist(ctx context.Context, url string) (bool, *downloader.PlaylistInfo, error) {
+	if downloader.IsInstagramSinglePost(url) {
+		return false, nil, nil
+	}
 	info, err := e.downloader.GetPlaylistInfo(ctx, url)
 	if err != nil {
 		return false, nil, err

@@ -40,10 +40,11 @@ func TestConfiguredYTDLPExecutableIsInvoked(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	markerPath := filepath.Join(tmpDir, "invoked")
+	expectedTMPDIR := filepath.Join(tmpDir, "downloads")
 	executablePath := filepath.Join(tmpDir, "yt-dlp-stub")
 	stub := `#!/bin/sh
 set -eu
-printf 'invoked\n' > "$YTDLP_MARKER"
+printf '%s\n' "$TMPDIR" > "$YTDLP_MARKER"
 printf '%s\n' '{"id":"video-1","title":"Stub Video","url":"https://example.com/video-1","duration":1,"playlist_title":"Stub Playlist","playlist_id":"stub-playlist"}'
 printf '%s\n' '{"id":"video-2","title":"Stub Video 2","url":"https://example.com/video-2","duration":1,"playlist_title":"Stub Playlist","playlist_id":"stub-playlist"}'
 `
@@ -51,8 +52,10 @@ printf '%s\n' '{"id":"video-2","title":"Stub Video 2","url":"https://example.com
 		t.Fatalf("write yt-dlp stub: %v", err)
 	}
 	t.Setenv("YTDLP_MARKER", markerPath)
+	t.Setenv("TMPDIR", filepath.Join(tmpDir, "inherited"))
 
 	d := New("", executablePath)
+	d.downloadDir = expectedTMPDIR
 	info, err := d.GetPlaylistInfo(context.Background(), "https://example.com/playlist")
 	if err != nil {
 		t.Fatalf("GetPlaylistInfo() error = %v", err)
@@ -60,8 +63,35 @@ printf '%s\n' '{"id":"video-2","title":"Stub Video 2","url":"https://example.com
 	if info.PlaylistCount != 2 || len(info.Entries) != 2 {
 		t.Fatalf("GetPlaylistInfo() = %+v, want two parsed entries", info)
 	}
+	gotTMPDIR, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read configured executable marker: %v", err)
+	}
+	if got := strings.TrimSpace(string(gotTMPDIR)); got != expectedTMPDIR {
+		t.Errorf("configured executable TMPDIR = %q, want %q", got, expectedTMPDIR)
+	}
+}
+
+func TestDefaultYTDLPExecutableUsesPATH(t *testing.T) {
+	tmpDir := t.TempDir()
+	markerPath := filepath.Join(tmpDir, "invoked")
+	executablePath := filepath.Join(tmpDir, "yt-dlp")
+	stub := `#!/bin/sh
+set -eu
+printf 'invoked\n' > "$YTDLP_MARKER"
+`
+	if err := os.WriteFile(executablePath, []byte(stub), 0755); err != nil {
+		t.Fatalf("write yt-dlp stub: %v", err)
+	}
+	t.Setenv("PATH", tmpDir)
+	t.Setenv("YTDLP_MARKER", markerPath)
+
+	d := New("", "")
+	if err := d.ytdlpCommand(context.Background(), "").Run(); err != nil {
+		t.Fatalf("run default yt-dlp executable: %v", err)
+	}
 	if _, err := os.Stat(markerPath); err != nil {
-		t.Fatalf("configured executable was not invoked: %v", err)
+		t.Fatalf("default executable was not resolved from PATH: %v", err)
 	}
 }
 

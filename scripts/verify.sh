@@ -14,17 +14,20 @@ REMOTE_APP_DIR="/home/$SERVICE_USER/sushe"
 REMOTE_YTDLP_PATH="$REMOTE_APP_DIR/bin/yt-dlp"
 REMOTE_ENV_PATH="$REMOTE_APP_DIR/.env"
 SSH_USER="$(ssh "$SSH_HOST" 'id -un')"
-if [[ "$SSH_USER" == "$SERVICE_USER" ]]; then
-    PRIVILEGE_PREFIX=()
-else
-    PRIVILEGE_PREFIX=(sudo)
-fi
 
 run_remote() {
     local remote_command
     printf -v remote_command '%q ' "$@"
     # shellcheck disable=SC2029 # printf %q has quoted each remote argument.
     ssh "$SSH_HOST" "$remote_command"
+}
+
+run_remote_as_service_owner() {
+    if [[ "$SSH_USER" == "$SERVICE_USER" ]]; then
+        run_remote "$@"
+    else
+        run_remote sudo "$@"
+    fi
 }
 
 echo "=== Telegram Bot API Server ==="
@@ -44,7 +47,7 @@ fi
 
 echo ""
 echo "=== Sushe yt-dlp runtime ==="
-REMOTE_CONFIG="$(run_remote "${PRIVILEGE_PREFIX[@]}" grep -Fx \
+REMOTE_CONFIG="$(run_remote_as_service_owner grep -Fx \
     "SUSHE_YTDLP=$REMOTE_YTDLP_PATH" "$REMOTE_ENV_PATH")"
 STARTED_AT="$(run_remote systemctl show sushe -p ExecMainStartTimestamp --value)"
 if [[ "$SSH_USER" == "$SERVICE_USER" ]]; then
@@ -57,7 +60,7 @@ else
         | grep -F "path=$REMOTE_YTDLP_PATH")"
 fi
 
-YTDLP_VERSION="$(run_remote "${PRIVILEGE_PREFIX[@]}" "$REMOTE_YTDLP_PATH" --version)"
+YTDLP_VERSION="$(run_remote_as_service_owner "$REMOTE_YTDLP_PATH" --version)"
 echo "Remote config: $REMOTE_CONFIG"
 echo "Live application: $LIVE_CONFIG"
 echo "Version: $YTDLP_VERSION"

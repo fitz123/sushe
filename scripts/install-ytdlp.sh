@@ -63,12 +63,14 @@ echo "    SHA-256 verified: $YTDLP_SHA256"
 # No remote filesystem mutation occurs before the pinned download passes the
 # hard-coded checksum above.
 SSH_USER="$(run_remote id -un)"
-if [[ "$SSH_USER" == "$SERVICE_USER" ]]; then
-    PRIVILEGE_PREFIX=()
-else
-    PRIVILEGE_PREFIX=(sudo)
-fi
-run_remote "${PRIVILEGE_PREFIX[@]}" test -f "$REMOTE_ENV_PATH" || {
+run_remote_as_service_owner() {
+    if [[ "$SSH_USER" == "$SERVICE_USER" ]]; then
+        run_remote "$@"
+    else
+        run_remote sudo "$@"
+    fi
+}
+run_remote_as_service_owner test -f "$REMOTE_ENV_PATH" || {
     echo "ERROR: remote environment file not found: $REMOTE_ENV_PATH" >&2
     exit 1
 }
@@ -80,7 +82,7 @@ scp "$LOCAL_YTDLP" "$SSH_HOST:$REMOTE_UPLOAD"
 # The helper stages both files beside their final destinations and renames
 # them into place. It reads the existing .env remotely and never places its
 # contents in command arguments or output.
-run_remote "${PRIVILEGE_PREFIX[@]}" bash -s -- \
+run_remote_as_service_owner bash -s -- \
     "$REMOTE_UPLOAD" \
     "$REMOTE_APP_DIR" \
     "$REMOTE_YTDLP_PATH" \
@@ -158,7 +160,7 @@ printf '    Installed %s at %s\n' "$actual_version" "$target"
 REMOTE
 REMOTE_UPLOAD=""
 
-REMOTE_CONFIG="$(run_remote "${PRIVILEGE_PREFIX[@]}" grep -Fx \
+REMOTE_CONFIG="$(run_remote_as_service_owner grep -Fx \
     "SUSHE_YTDLP=$REMOTE_YTDLP_PATH" "$REMOTE_ENV_PATH")"
 RESTART_STARTED_AT="$(run_remote date --iso-8601=seconds)"
 echo "==> Restarting sushe"
@@ -166,7 +168,7 @@ run_remote sudo systemctl restart sushe
 sleep 1
 
 echo "==> Verifying installed version and live application configuration"
-REMOTE_VERSION="$(run_remote "${PRIVILEGE_PREFIX[@]}" "$REMOTE_YTDLP_PATH" --version)"
+REMOTE_VERSION="$(run_remote_as_service_owner "$REMOTE_YTDLP_PATH" --version)"
 if [[ "$REMOTE_VERSION" != "$YTDLP_VERSION" ]]; then
     printf 'ERROR: installed yt-dlp version is %s, expected %s\n' \
         "$REMOTE_VERSION" "$YTDLP_VERSION" >&2

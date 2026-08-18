@@ -3,12 +3,67 @@ package downloader
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fitz123/sushe/internal/logger"
 )
+
+func TestNewYTDLPPath(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "empty uses PATH", path: "", want: "yt-dlp"},
+		{name: "whitespace uses PATH", path: " \t\n", want: "yt-dlp"},
+		{name: "configured path is trimmed", path: "  /opt/sushe/yt-dlp \t", want: "/opt/sushe/yt-dlp"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := New("", tt.path)
+			if d.ytdlpPath != tt.want {
+				t.Errorf("New(%q).ytdlpPath = %q, want %q", tt.path, d.ytdlpPath, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfiguredYTDLPExecutableIsInvoked(t *testing.T) {
+	logger.Init("error")
+
+	tmpDir := t.TempDir()
+	markerPath := filepath.Join(tmpDir, "invoked")
+	executablePath := filepath.Join(tmpDir, "yt-dlp-stub")
+	stub := `#!/bin/sh
+set -eu
+printf 'invoked\n' > "$YTDLP_MARKER"
+printf '%s\n' '{"id":"video-1","title":"Stub Video","url":"https://example.com/video-1","duration":1,"playlist_title":"Stub Playlist","playlist_id":"stub-playlist"}'
+printf '%s\n' '{"id":"video-2","title":"Stub Video 2","url":"https://example.com/video-2","duration":1,"playlist_title":"Stub Playlist","playlist_id":"stub-playlist"}'
+`
+	if err := os.WriteFile(executablePath, []byte(stub), 0755); err != nil {
+		t.Fatalf("write yt-dlp stub: %v", err)
+	}
+	t.Setenv("YTDLP_MARKER", markerPath)
+
+	d := New("", executablePath)
+	info, err := d.GetPlaylistInfo(context.Background(), "https://example.com/playlist")
+	if err != nil {
+		t.Fatalf("GetPlaylistInfo() error = %v", err)
+	}
+	if info.PlaylistCount != 2 || len(info.Entries) != 2 {
+		t.Fatalf("GetPlaylistInfo() = %+v, want two parsed entries", info)
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("configured executable was not invoked: %v", err)
+	}
+}
 
 func TestCookieArgs(t *testing.T) {
 	tests := []struct {

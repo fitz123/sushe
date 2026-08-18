@@ -74,7 +74,7 @@ func main() {
 	// Initialize the bot with local API server
 	// Custom HTTP client with long timeout for large file uploads (up to 2GB via local Bot API)
 	botPref := tele.Settings{
-		Token:  token,
+		Token: token,
 		Poller: &tele.LongPoller{
 			Timeout:        10 * time.Second,
 			AllowedUpdates: []string{"message", "edited_message", "channel_post", "callback_query"},
@@ -94,10 +94,19 @@ func main() {
 
 	// Create shared download engine
 	// SUSHE_COOKIES is an optional absolute path to a Netscape-format cookies file
-	// passed to every yt-dlp invocation as --cookies <path>. Empty disables cookies.
-	// Trim once at the boundary so trailing whitespace from a systemd Environment=
-	// line doesn't yield a malformed path.
-	eng := engine.NewEngine(strings.TrimSpace(os.Getenv("SUSHE_COOKIES")))
+	// passed to every yt-dlp invocation as --cookies <path>. SUSHE_YTDLP selects
+	// the yt-dlp executable; empty preserves the bare command and PATH lookup.
+	// Trim once at the boundary so trailing whitespace from environment values
+	// does not yield malformed paths.
+	ytdlpPath := strings.TrimSpace(os.Getenv("SUSHE_YTDLP"))
+	eng := engine.NewEngine(
+		strings.TrimSpace(os.Getenv("SUSHE_COOKIES")),
+		ytdlpPath,
+	)
+	if ytdlpPath == "" {
+		ytdlpPath = "yt-dlp"
+	}
+	logger.Info("yt-dlp executable configured", "path", ytdlpPath)
 
 	// Initialize bot service
 	botService := bot.NewBotService(botInstance, eng, allowedUsers)

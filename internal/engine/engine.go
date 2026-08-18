@@ -17,10 +17,11 @@ type Engine struct {
 }
 
 // NewEngine creates a new Engine with a fresh Downloader instance.
-// cookiesPath is forwarded to the Downloader; pass "" to disable cookies.
-func NewEngine(cookiesPath string) *Engine {
+// Pass an empty cookiesPath to disable cookies and an empty ytdlpPath to use
+// the bare "yt-dlp" command from PATH.
+func NewEngine(cookiesPath, ytdlpPath string) *Engine {
 	return &Engine{
-		downloader: downloader.New(cookiesPath),
+		downloader: downloader.New(cookiesPath, ytdlpPath),
 	}
 }
 

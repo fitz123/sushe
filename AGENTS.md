@@ -36,6 +36,7 @@ sushe/
 ├── scripts/
 │   ├── deploy.sh               # Full server deployment
 │   ├── update.sh               # Quick binary update
+│   ├── install-ytdlp.sh        # Install pinned service-owned yt-dlp nightly
 │   ├── verify.sh               # Service status check
 │   └── build-bot-api.sh        # Build telegram-bot-api server
 ├── bin/                        # Built binaries (gitignored)
@@ -183,18 +184,19 @@ SUSHE_API_TOKEN=your_api_token    # Bearer token for POST /api/download
 SUSHE_API_PORT=8082               # HTTP API port (default: 8082)
 ```
 
-Optional (authenticated downloads):
+Optional runtime settings:
 ```
 SUSHE_COOKIES=<path>              # absolute path to Netscape-format cookies file; passed to yt-dlp as `--cookies`
+SUSHE_YTDLP=<path>                # yt-dlp executable; empty uses `yt-dlp` from PATH
 ```
 
-Note: `SUSHE_COOKIES` is set on the server via a systemd drop-in (see "Cookies for authenticated downloads" below), not in `.env`. `.env` is for local-machine deploy config (SSH host, etc.).
+Note: `SUSHE_COOKIES` is set on the server via systemd (see "Cookies for authenticated downloads" below), not in `.env`. The pinned updater writes `SUSHE_YTDLP` only to the remote application `.env`; it does not alter the local deploy `.env`, which holds SSH/deploy configuration.
 
 ## Key Functions
 
 ### engine.go
 
-- `NewEngine(cookiesPath string)` - Create engine with downloader instance; pass `""` to disable cookies
+- `NewEngine(cookiesPath, ytdlpPath string)` - Create engine with downloader instance; empty values disable cookies and use `yt-dlp` from PATH
 - `Process(ctx, url, progressCb)` - Download + codec check + transcode + split → ProcessResult
 - `ProcessPlaylist(ctx, url, progressCb)` - Process playlist → []ProcessResult
 - `IsPlaylist(ctx, url)` - Check if URL is a playlist
@@ -319,8 +321,9 @@ This section describes restricted access for an AI developer agent working on th
 | Path | Description |
 |------|-------------|
 | `/home/sushe/sushe/bin/sushe` | Bot binary |
+| `/home/sushe/sushe/bin/yt-dlp` | Checksum-pinned service yt-dlp binary |
 | `/tmp/sushe/` | Temp directory for downloads/encoding |
-| `/usr/local/bin/yt-dlp` | yt-dlp binary |
+| `/usr/local/bin/yt-dlp` | System yt-dlp fallback when `SUSHE_YTDLP` is empty |
 
 ### Systemd Services
 
@@ -365,8 +368,26 @@ This section describes restricted access for an AI developer agent working on th
 
 3. **Workflow:**
    - `make build` — cross-compile the bot binary
-   - `make update` — build + scp + restart (uses `.env` for SSH)
-   - `make verify` — check service status and recent logs
+   - `make update` — build + scp + restart; works for both admin and restricted service-user SSH logins
+   - `make update-ytdlp` — install the pinned nightly, update the remote application `.env`, and restart only Sushe
+   - `make verify` — check service status, recent logs, live yt-dlp path, and pinned version
+
+### Pinned yt-dlp nightly
+
+`make update-ytdlp` downloads the official Linux standalone nightly
+`2026.08.17.073947`, verifies its hard-coded SHA-256 before touching the
+server, and atomically installs it as `/home/sushe/sushe/bin/yt-dlp`. The
+script preserves every unrelated line in the remote application `.env` while
+setting `SUSHE_YTDLP=/home/sushe/sushe/bin/yt-dlp`, restarts only
+`sushe.service`, and verifies the exact binary version plus the restarted
+application's configured yt-dlp path from its startup log.
+
+The script supports the restricted `sushe` login without privileged file
+operations; its only sudo command in that mode is the allowlisted
+`systemctl restart sushe`. It also retains an admin-login path for initial
+operator setup. To change the pin, update the version, release URL, checksum,
+and expected version in `scripts/install-ytdlp.sh` and `scripts/verify.sh`
+together.
 
 ### Cookies for authenticated downloads
 

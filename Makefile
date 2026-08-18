@@ -3,7 +3,7 @@ BINARY_NAME := sushe
 LDFLAGS := '-linkmode external -extldflags "-static" -s -w'
 
 # Phony targets
-.PHONY: all build build-bot-api deploy update verify clean test run help deps
+.PHONY: all build build-bot-api deploy update update-ytdlp verify clean test run help deps
 
 # Default target
 all: update
@@ -39,6 +39,10 @@ deploy:
 update: build
 	./scripts/update.sh
 
+# Install the checksum-pinned service-owned yt-dlp nightly
+update-ytdlp:
+	./scripts/install-ytdlp.sh
+
 # Verify deployment
 verify:
 	./scripts/verify.sh
@@ -66,6 +70,7 @@ help:
 	@echo "Deployment:"
 	@echo "  deploy     - First-time deployment (user, firewall, systemd)"
 	@echo "  update     - Update existing deployment (default)"
+	@echo "  update-ytdlp - Install the pinned service-owned yt-dlp nightly"
 	@echo "  verify     - Check deployment status and logs"
 	@echo ""
 	@echo "Development:"

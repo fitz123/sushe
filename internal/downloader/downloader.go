@@ -150,6 +150,7 @@ type Downloader struct {
 	downloadDir string
 	timeout     time.Duration
 	cookiesPath string
+	ytdlpPath   string
 
 	// igMu guards igLastAt and serializes Instagram-bound yt-dlp invocations
 	// across all goroutines. See waitForIGSlot for the rationale.
@@ -162,17 +163,21 @@ type Downloader struct {
 
 // New creates a Downloader. If cookiesPath is non-empty, every yt-dlp invocation
 // is passed `--cookies <path>` so authenticated sessions (e.g. Instagram) work.
-// Pass "" to disable cookies. The path is trimmed of surrounding whitespace
-// (defends against misconfigured systemd Environment= lines with trailing
-// space/tab). Logs a warning if cookiesPath is non-empty but unreadable, so
-// misconfiguration surfaces at startup instead of as an opaque yt-dlp error.
-func New(cookiesPath string) *Downloader {
+// If ytdlpPath is empty, the bare "yt-dlp" command preserves PATH lookup.
+// Both values are trimmed of surrounding whitespace. Logs a warning if
+// cookiesPath is non-empty but unreadable, so misconfiguration surfaces at
+// startup instead of as an opaque yt-dlp error.
+func New(cookiesPath, ytdlpPath string) *Downloader {
 	// Ensure download directory exists
 	os.MkdirAll(DownloadDir, 0755)
 
 	// Canonicalize once: trim surrounding whitespace so all downstream
 	// consumers (cookieArgs, the os.Stat check below) see the same value.
 	cookiesPath = strings.TrimSpace(cookiesPath)
+	ytdlpPath = strings.TrimSpace(ytdlpPath)
+	if ytdlpPath == "" {
+		ytdlpPath = "yt-dlp"
+	}
 
 	// One-time readability check on the cookies file so a misconfigured
 	// SUSHE_COOKIES path surfaces clearly at startup instead of as an
@@ -205,6 +210,7 @@ func New(cookiesPath string) *Downloader {
 		downloadDir: DownloadDir,
 		timeout:     DefaultTimeout,
 		cookiesPath: cookiesPath,
+		ytdlpPath:   ytdlpPath,
 	}
 }
 
@@ -336,7 +342,7 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cmdCtx, "yt-dlp", args...)
+	cmd := exec.CommandContext(cmdCtx, d.ytdlpPath, args...)
 	cmd.Dir = workDir
 
 	// If we have a progress callback, stream output; otherwise use simple execution
@@ -620,7 +626,7 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 
 	logger.Debug("Checking if URL is playlist", "args", args)
 
-	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	cmd := exec.CommandContext(ctx, d.ytdlpPath, args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get playlist info: %w", err)
@@ -764,7 +770,7 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cmdCtx, "yt-dlp", args...)
+	cmd := exec.CommandContext(cmdCtx, d.ytdlpPath, args...)
 	cmd.Dir = workDir
 
 	// If we have a progress callback, stream output; otherwise use simple execution

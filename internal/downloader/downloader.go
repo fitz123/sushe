@@ -214,6 +214,16 @@ func New(cookiesPath, ytdlpPath string) *Downloader {
 	}
 }
 
+// ytdlpCommand constructs a yt-dlp subprocess with the downloader's writable
+// directory as its temporary directory. The explicit final TMPDIR entry
+// overrides any inherited value when the command environment is de-duplicated.
+func (d *Downloader) ytdlpCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, d.ytdlpPath, args...)
+	cmd.Dir = dir
+	cmd.Env = append(cmd.Environ(), "TMPDIR="+d.downloadDir)
+	return cmd
+}
+
 // waitForIGSlot enforces a process-wide minimum gap (minIGGap) between
 // Instagram-bound yt-dlp invocations. For non-Instagram URLs (and unparseable
 // URLs) it returns nil immediately without acquiring the lock. For IG URLs,
@@ -342,8 +352,7 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cmdCtx, d.ytdlpPath, args...)
-	cmd.Dir = workDir
+	cmd := d.ytdlpCommand(cmdCtx, workDir, args...)
 
 	// If we have a progress callback, stream output; otherwise use simple execution
 	if progressCb != nil {
@@ -626,7 +635,7 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 
 	logger.Debug("Checking if URL is playlist", "args", args)
 
-	cmd := exec.CommandContext(ctx, d.ytdlpPath, args...)
+	cmd := d.ytdlpCommand(ctx, "", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get playlist info: %w", err)
@@ -770,8 +779,7 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cmdCtx, d.ytdlpPath, args...)
-	cmd.Dir = workDir
+	cmd := d.ytdlpCommand(cmdCtx, workDir, args...)
 
 	// If we have a progress callback, stream output; otherwise use simple execution
 	if progressCb != nil {

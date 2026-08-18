@@ -5,12 +5,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
+# shellcheck source=/dev/null
 source "$REPO_DIR/.env"
 
 # Service user on the remote server (where the binary actually lives). The
 # SSH login user (SSH_HOST) may be a different admin account with sudo, so
 # we cannot scp directly into /home/$REMOTE_USER/.
 REMOTE_USER="${REMOTE_USER:-sushe}"
+REMOTE_BIN_DIR="/home/$REMOTE_USER/sushe/bin"
+
+run_remote() {
+    local remote_command
+    printf -v remote_command '%q ' "$@"
+    # shellcheck disable=SC2029 # printf %q has quoted each remote argument.
+    ssh "$SSH_HOST" "$remote_command"
+}
 
 echo "Building and deploying update..."
 
@@ -28,29 +37,52 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 echo "Transferring binary..."
 # Use remote-side mktemp for unique paths (local $$ can collide across
 # operators running concurrent updates from different machines).
-TMP_BIN="$(ssh "$SSH_HOST" 'mktemp /tmp/sushe-update-XXXXXX')"
+TMP_BIN="$(run_remote mktemp /tmp/sushe-update-XXXXXX)"
 # Local trap so the remote temp file is cleaned up even if a later step fails.
-trap 'ssh "$SSH_HOST" "rm -f $TMP_BIN" 2>/dev/null || true' EXIT
+cleanup() {
+    run_remote rm -f -- "$TMP_BIN" 2>/dev/null || true
+}
+trap cleanup EXIT
 scp bin/sushe "$SSH_HOST:$TMP_BIN"
 
+SSH_USER="$(run_remote id -un)"
+
 echo "Pre-flight check..."
-# Use sudo so the check works regardless of whether the SSH user can
-# traverse /home/$REMOTE_USER/ (mode 700 by default; admin SSH user
-# typically isn't in the service-user group).
-ssh "$SSH_HOST" "sudo test -x /home/$REMOTE_USER/sushe/bin/telegram-bot-api" \
-    || { echo "ERROR: telegram-bot-api binary missing on server! Run 'make deploy' to restore it."; exit 1; }
+if [[ "$SSH_USER" == "$REMOTE_USER" ]]; then
+    run_remote test -x "$REMOTE_BIN_DIR/telegram-bot-api" \
+        || { echo "ERROR: telegram-bot-api binary missing on server! Run 'make deploy' to restore it."; exit 1; }
+else
+    # Admin-login mode retains the sudo pre-flight needed when the admin
+    # cannot traverse the service user's home directory.
+    run_remote sudo test -x "$REMOTE_BIN_DIR/telegram-bot-api" \
+        || { echo "ERROR: telegram-bot-api binary missing on server! Run 'make deploy' to restore it."; exit 1; }
+fi
 
 echo "Installing binary and restarting..."
-# sudo install handles the chown+chmod+atomic-rename in one go. Owner and
-# group set to REMOTE_USER so the service user owns its own binary even when
-# we ssh in as a different admin account.
-ssh "$SSH_HOST" "sudo install -o $REMOTE_USER -g $REMOTE_USER -m 0755 $TMP_BIN /home/$REMOTE_USER/sushe/bin/sushe"
-ssh "$SSH_HOST" "sudo systemctl restart sushe"
+if [[ "$SSH_USER" == "$REMOTE_USER" ]]; then
+    # Restricted service-user mode: install in the user-owned directory and
+    # use no sudo except the allowlisted Sushe restart below.
+    run_remote bash -s -- "$TMP_BIN" "$REMOTE_BIN_DIR/sushe" <<'REMOTE'
+set -euo pipefail
+source_path=$1
+target_path=$2
+stage_path="$(mktemp "${target_path}.XXXXXX")"
+trap 'rm -f "$source_path" "$stage_path"' EXIT
+install -m 0755 "$source_path" "$stage_path"
+mv -f "$stage_path" "$target_path"
+REMOTE
+else
+    # Existing admin-login mode: sudo installs with service-user ownership.
+    run_remote sudo install -o "$REMOTE_USER" -g "$REMOTE_USER" -m 0755 "$TMP_BIN" "$REMOTE_BIN_DIR/sushe"
+fi
+run_remote sudo systemctl restart sushe
 
 sleep 2
 
 echo "Verifying..."
-ssh "$SSH_HOST" "systemctl is-active telegram-bot-api && echo 'Bot API running'"
-ssh "$SSH_HOST" "systemctl is-active sushe && echo 'Sushe running'"
+run_remote systemctl is-active telegram-bot-api
+echo "Bot API running"
+run_remote systemctl is-active sushe
+echo "Sushe running"
 
 echo "Update complete!"

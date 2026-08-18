@@ -74,7 +74,7 @@ func main() {
 	// Initialize the bot with local API server
 	// Custom HTTP client with long timeout for large file uploads (up to 2GB via local Bot API)
 	botPref := tele.Settings{
-		Token:  token,
+		Token: token,
 		Poller: &tele.LongPoller{
 			Timeout:        10 * time.Second,
 			AllowedUpdates: []string{"message", "edited_message", "channel_post", "callback_query"},
@@ -98,10 +98,15 @@ func main() {
 	// the yt-dlp executable; empty preserves the bare command and PATH lookup.
 	// Trim once at the boundary so trailing whitespace from environment values
 	// does not yield malformed paths.
+	ytdlpPath := strings.TrimSpace(os.Getenv("SUSHE_YTDLP"))
 	eng := engine.NewEngine(
 		strings.TrimSpace(os.Getenv("SUSHE_COOKIES")),
-		strings.TrimSpace(os.Getenv("SUSHE_YTDLP")),
+		ytdlpPath,
 	)
+	if ytdlpPath == "" {
+		ytdlpPath = "yt-dlp"
+	}
+	logger.Info("yt-dlp executable configured", "path", ytdlpPath)
 
 	// Initialize bot service
 	botService := bot.NewBotService(botInstance, eng, allowedUsers)

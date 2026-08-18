@@ -379,8 +379,8 @@ This section describes restricted access for an AI developer agent working on th
 server, and atomically installs it as `/home/sushe/sushe/bin/yt-dlp`. The
 script preserves every unrelated line in the remote application `.env` while
 setting `SUSHE_YTDLP=/home/sushe/sushe/bin/yt-dlp`, restarts only
-`sushe.service`, and verifies both the exact binary version and the live
-process environment.
+`sushe.service`, and verifies the exact binary version plus the restarted
+application's configured yt-dlp path from its startup log.
 
 The script supports the restricted `sushe` login without privileged file
 operations; its only sudo command in that mode is the allowlisted

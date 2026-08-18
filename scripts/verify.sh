@@ -10,6 +10,9 @@ source "$REPO_DIR/.env"
 
 SERVICE_USER="${REMOTE_USER:-sushe}"
 EXPECTED_YTDLP_VERSION="2026.08.17.073947"
+REMOTE_APP_DIR="/home/$SERVICE_USER/sushe"
+REMOTE_YTDLP_PATH="$REMOTE_APP_DIR/bin/yt-dlp"
+REMOTE_ENV_PATH="$REMOTE_APP_DIR/.env"
 SSH_USER="$(ssh "$SSH_HOST" 'id -un')"
 if [[ "$SSH_USER" == "$SERVICE_USER" ]]; then
     PRIVILEGE_PREFIX=()
@@ -41,22 +44,22 @@ fi
 
 echo ""
 echo "=== Sushe yt-dlp runtime ==="
-LIVE_YTDLP="$(run_remote "${PRIVILEGE_PREFIX[@]}" bash -s <<'REMOTE'
-set -euo pipefail
-pid="$(systemctl show sushe -p MainPID --value)"
-test "$pid" != 0
-tr '\0' '\n' < "/proc/$pid/environ" | grep '^SUSHE_YTDLP=' || true
-REMOTE
-)"
-if [[ -n "$LIVE_YTDLP" ]]; then
-    YTDLP_PATH="${LIVE_YTDLP#SUSHE_YTDLP=}"
-    echo "Live process: $LIVE_YTDLP"
+REMOTE_CONFIG="$(run_remote "${PRIVILEGE_PREFIX[@]}" grep -Fx \
+    "SUSHE_YTDLP=$REMOTE_YTDLP_PATH" "$REMOTE_ENV_PATH")"
+STARTED_AT="$(run_remote systemctl show sushe -p ExecMainStartTimestamp --value)"
+if [[ "$SSH_USER" == "$SERVICE_USER" ]]; then
+    LIVE_CONFIG="$(run_remote sudo sushe-logs --since "$STARTED_AT" \
+        --grep 'yt-dlp executable configured' -n 1 --no-pager \
+        | grep -F "path=$REMOTE_YTDLP_PATH")"
 else
-    YTDLP_PATH="yt-dlp"
-    echo "Live process: SUSHE_YTDLP unset (using PATH fallback)"
+    LIVE_CONFIG="$(run_remote sudo journalctl -u sushe --since "$STARTED_AT" \
+        --grep 'yt-dlp executable configured' -n 1 --no-pager \
+        | grep -F "path=$REMOTE_YTDLP_PATH")"
 fi
 
-YTDLP_VERSION="$(run_remote "${PRIVILEGE_PREFIX[@]}" "$YTDLP_PATH" --version)"
+YTDLP_VERSION="$(run_remote "${PRIVILEGE_PREFIX[@]}" "$REMOTE_YTDLP_PATH" --version)"
+echo "Remote config: $REMOTE_CONFIG"
+echo "Live application: $LIVE_CONFIG"
 echo "Version: $YTDLP_VERSION"
 if [[ "$YTDLP_VERSION" != "$EXPECTED_YTDLP_VERSION" ]]; then
     echo "ERROR: expected yt-dlp $EXPECTED_YTDLP_VERSION" >&2

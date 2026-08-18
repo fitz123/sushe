@@ -158,11 +158,14 @@ printf '    Installed %s at %s\n' "$actual_version" "$target"
 REMOTE
 REMOTE_UPLOAD=""
 
+REMOTE_CONFIG="$(run_remote "${PRIVILEGE_PREFIX[@]}" grep -Fx \
+    "SUSHE_YTDLP=$REMOTE_YTDLP_PATH" "$REMOTE_ENV_PATH")"
+RESTART_STARTED_AT="$(run_remote date --iso-8601=seconds)"
 echo "==> Restarting sushe"
 run_remote sudo systemctl restart sushe
 sleep 1
 
-echo "==> Verifying installed version and live process environment"
+echo "==> Verifying installed version and live application configuration"
 REMOTE_VERSION="$(run_remote "${PRIVILEGE_PREFIX[@]}" "$REMOTE_YTDLP_PATH" --version)"
 if [[ "$REMOTE_VERSION" != "$YTDLP_VERSION" ]]; then
     printf 'ERROR: installed yt-dlp version is %s, expected %s\n' \
@@ -170,15 +173,18 @@ if [[ "$REMOTE_VERSION" != "$YTDLP_VERSION" ]]; then
     exit 1
 fi
 
-LIVE_YTDLP="$(run_remote "${PRIVILEGE_PREFIX[@]}" bash -s -- "$REMOTE_YTDLP_PATH" <<'REMOTE'
-set -euo pipefail
-pid="$(systemctl show sushe -p MainPID --value)"
-test "$pid" != 0
-tr '\0' '\n' < "/proc/$pid/environ" | grep -Fx "SUSHE_YTDLP=$1"
-REMOTE
-)"
+if [[ "$SSH_USER" == "$SERVICE_USER" ]]; then
+    LIVE_CONFIG="$(run_remote sudo sushe-logs --since "$RESTART_STARTED_AT" \
+        --grep 'yt-dlp executable configured' -n 1 --no-pager \
+        | grep -F "path=$REMOTE_YTDLP_PATH")"
+else
+    LIVE_CONFIG="$(run_remote sudo journalctl -u sushe --since "$RESTART_STARTED_AT" \
+        --grep 'yt-dlp executable configured' -n 1 --no-pager \
+        | grep -F "path=$REMOTE_YTDLP_PATH")"
+fi
 run_remote systemctl is-active --quiet sushe
 
+echo "    Remote config: $REMOTE_CONFIG"
 echo "    Version: $REMOTE_VERSION"
-echo "    Live process: $LIVE_YTDLP"
+echo "    Live application: $LIVE_CONFIG"
 echo "==> Pinned yt-dlp update complete"

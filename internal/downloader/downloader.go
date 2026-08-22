@@ -366,7 +366,9 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 		url,
 	)
 
-	logger.Debug("Running yt-dlp", "args", args)
+	// Do not log arguments: the source URL may contain ephemeral signed query
+	// credentials. Count is enough to diagnose invocation-shape drift.
+	logger.Debug("Running yt-dlp", "argument_count", len(args))
 
 	// Create context with timeout
 	cmdCtx, cancel := context.WithTimeoutCause(ctx, d.timeout, errYTDLPDeadline)
@@ -681,7 +683,9 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 		url,
 	)
 
-	logger.Debug("Checking if URL is playlist", "args", args)
+	// Do not log arguments: the source URL may contain ephemeral signed query
+	// credentials. Count is enough to diagnose invocation-shape drift.
+	logger.Debug("Checking if URL is playlist", "argument_count", len(args))
 
 	cmd := d.ytdlpCommand(ctx, "", args...)
 	output, err := cmd.Output()
@@ -821,7 +825,9 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 		playlistURL,
 	)
 
-	logger.Debug("Downloading playlist video", "index", videoIndex, "args", args)
+	// Do not log arguments: the source URL may contain ephemeral signed query
+	// credentials. Count is enough to diagnose invocation-shape drift.
+	logger.Debug("Downloading playlist video", "index", videoIndex, "argument_count", len(args))
 
 	// Create context with timeout
 	cmdCtx, cancel := context.WithTimeoutCause(ctx, d.timeout, errYTDLPDeadline)

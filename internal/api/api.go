@@ -204,7 +204,7 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 			playlistErr = ctx.Err()
 		}
 		handleErr := engineTerminalError(ctx, playlistErr, phase.current(), engineTimeout)
-		logger.Error("API playlist detection failed", "url", req.URL, "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
+		logger.Error("API playlist detection failed", "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
 		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: handleErr.Error()})
 		s.dedup.Release(dedupKey)
 		return
@@ -260,7 +260,7 @@ func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWr
 	result, err := s.processor.Process(ctx, req.URL, progressCb)
 	if err != nil {
 		handleErr = engineTerminalError(ctx, err, phase.current(), engineTimeout)
-		logger.Error("API engine job failed", "url", req.URL, "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
+		logger.Error("API engine job failed", "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
 		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: handleErr.Error()})
 		return
 	}
@@ -312,7 +312,7 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 	results, err := s.processor.ProcessPlaylist(ctx, req.URL, progressCb)
 	if err != nil {
 		handleErr = engineTerminalError(ctx, err, phase.current(), engineTimeout)
-		logger.Error("API playlist engine job failed", "url", req.URL, "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
+		logger.Error("API playlist engine job failed", "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
 		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: handleErr.Error()})
 		return
 	}

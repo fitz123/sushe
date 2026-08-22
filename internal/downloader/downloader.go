@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/url"
@@ -77,6 +78,8 @@ type Progress struct {
 // ProgressCallback is called with progress updates
 type ProgressCallback func(Progress)
 
+var errYTDLPDeadline = errors.New("yt-dlp subprocess deadline exceeded")
+
 const (
 	// Local Bot API server allows up to 2GB uploads
 	MaxFileSize    = 2000 * 1024 * 1024 // 2GB in bytes
@@ -86,8 +89,8 @@ const (
 	DefaultTimeout = 60 * time.Minute // Increased for long videos
 
 	// Playlist limits
-	MaxPlaylistVideos = 50             // Maximum videos per playlist
-	MaxVideoDuration  = 2 * time.Hour  // Skip videos longer than 2 hours
+	MaxPlaylistVideos = 50            // Maximum videos per playlist
+	MaxVideoDuration  = 2 * time.Hour // Skip videos longer than 2 hours
 
 	// minIGGap is the minimum spacing between Instagram-bound yt-dlp invocations
 	// across all goroutines. yt-dlp's --sleep-interval only governs intervals
@@ -117,10 +120,10 @@ type PartInfo struct {
 
 // PlaylistInfo contains information about a playlist
 type PlaylistInfo struct {
-	ID           string            `json:"id"`
-	Title        string            `json:"title"`
-	PlaylistCount int              `json:"playlist_count"`
-	Entries      []PlaylistEntry   `json:"entries"`
+	ID            string          `json:"id"`
+	Title         string          `json:"title"`
+	PlaylistCount int             `json:"playlist_count"`
+	Entries       []PlaylistEntry `json:"entries"`
 }
 
 // PlaylistEntry represents a single video in a playlist
@@ -349,7 +352,7 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	logger.Debug("Running yt-dlp", "args", args)
 
 	// Create context with timeout
-	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
+	cmdCtx, cancel := context.WithTimeoutCause(ctx, d.timeout, errYTDLPDeadline)
 	defer cancel()
 
 	cmd := d.ytdlpCommand(cmdCtx, workDir, args...)
@@ -357,6 +360,7 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	// If we have a progress callback, stream output; otherwise use simple execution
 	if progressCb != nil {
 		if err := d.runWithProgress(cmd, progressCb); err != nil {
+			err = d.ytdlpTerminalError(cmdCtx, err)
 			logger.Error("yt-dlp failed", "error", err)
 			os.RemoveAll(workDir)
 			return nil, fmt.Errorf("download failed: %w", err)
@@ -364,6 +368,7 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	} else {
 		output, err := cmd.CombinedOutput()
 		if err != nil {
+			err = d.ytdlpTerminalError(cmdCtx, err)
 			logger.Error("yt-dlp failed", "error", err, "output", string(output))
 			os.RemoveAll(workDir)
 			return nil, fmt.Errorf("download failed: %w - %s", err, string(output))
@@ -490,6 +495,16 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 		IsSplit:     false,
 		Parts:       nil,
 	}, nil
+}
+
+// ytdlpTerminalError identifies only the downloader's own subprocess deadline.
+// If the caller's context ended first, its cause is preserved for the caller to
+// classify at that lifecycle boundary.
+func (d *Downloader) ytdlpTerminalError(ctx context.Context, commandErr error) error {
+	if errors.Is(context.Cause(ctx), errYTDLPDeadline) {
+		return fmt.Errorf("yt-dlp subprocess deadline exceeded after %s: %w", d.timeout, context.DeadlineExceeded)
+	}
+	return commandErr
 }
 
 // runWithProgress runs yt-dlp and parses progress output
@@ -667,7 +682,7 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 		id, _ := entry["id"].(string)
 		title, _ := entry["title"].(string)
 		url, _ := entry["url"].(string)
-		
+
 		// Handle duration (might be null for unavailable videos)
 		var duration float64
 		if d, ok := entry["duration"]; ok && d != nil {
@@ -729,10 +744,10 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 	}
 
 	return &PlaylistInfo{
-		ID:           playlistID,
-		Title:        playlistTitle,
+		ID:            playlistID,
+		Title:         playlistTitle,
 		PlaylistCount: len(validEntries),
-		Entries:      validEntries,
+		Entries:       validEntries,
 	}, nil
 }
 
@@ -740,8 +755,8 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 //
 // Per-item IG rate limiting: each playlist item is an actual media download
 // (the burst signal Instagram flags), so the gate runs per item. With a 50-item
-// IG playlist at minIGGap=8s the floor wait is 50*8s = ~6min of gating — well
-// within the 15-minute request timeout, and playlists are inherently slow.
+// IG playlist at minIGGap=8s the floor wait is 50*8s = ~6min of gating, and
+// playlists are inherently slow.
 func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL string, videoIndex int, progressCb ProgressCallback) (*DownloadResult, error) {
 	// Enforce per-item IG rate-limit gap.
 	if err := d.waitForIGSlot(ctx, playlistURL, progressCb); err != nil {
@@ -776,7 +791,7 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	logger.Debug("Downloading playlist video", "index", videoIndex, "args", args)
 
 	// Create context with timeout
-	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
+	cmdCtx, cancel := context.WithTimeoutCause(ctx, d.timeout, errYTDLPDeadline)
 	defer cancel()
 
 	cmd := d.ytdlpCommand(cmdCtx, workDir, args...)
@@ -784,6 +799,7 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	// If we have a progress callback, stream output; otherwise use simple execution
 	if progressCb != nil {
 		if err := d.runWithProgress(cmd, progressCb); err != nil {
+			err = d.ytdlpTerminalError(cmdCtx, err)
 			logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err)
 			os.RemoveAll(workDir)
 			return nil, fmt.Errorf("download failed: %w", err)
@@ -791,6 +807,7 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	} else {
 		output, err := cmd.CombinedOutput()
 		if err != nil {
+			err = d.ytdlpTerminalError(cmdCtx, err)
 			logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err, "output", string(output))
 			os.RemoveAll(workDir)
 			return nil, fmt.Errorf("download failed: %w - %s", err, string(output))

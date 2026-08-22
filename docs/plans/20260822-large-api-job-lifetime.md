@@ -37,12 +37,12 @@ go build ./...
 **Goal:** Large API jobs cross the former 15-minute boundary while deadline/cancellation output identifies the active phase and actual bound.
 **Serves:** Ninja's requirement that legitimate large jobs finish under bounded custody or fail with a clear phase/bound result.
 
-- [ ] Define one named API engine/job deadline derived from `downloader.DefaultTimeout` (`2 *` the 60-minute subprocess bound), expose only an unexported per-service test override, and replace the fixed 15-minute context.
-- [ ] Track the latest engine progress phase race-safely for single-video and playlist paths.
-- [ ] Distinguish the named API deadline from caller/client cancellation using context cause/state rather than error-string matching; emit/log an actionable terminal NDJSON error naming phase and bound while preserving ordinary engine errors.
-- [ ] Make yt-dlp subprocess deadline errors name their separate per-download bound when that bound—not the caller context—fires.
-- [ ] Preserve deferred dedup completion/release behavior and keep the unrelated cache TTL unchanged.
-- [ ] Run focused API/downloader tests before Task 2.
+- [x] Define one named API engine/job deadline derived from `downloader.DefaultTimeout` (`2 *` the 60-minute subprocess bound), expose only an unexported per-service test override, and replace the fixed 15-minute context.
+- [x] Track the latest engine progress phase race-safely for single-video and playlist paths.
+- [x] Distinguish the named API deadline from caller/client cancellation using context cause/state rather than error-string matching; emit/log an actionable terminal NDJSON error naming phase and bound while preserving ordinary engine errors.
+- [x] Make yt-dlp subprocess deadline errors name their separate per-download bound when that bound—not the caller context—fires.
+- [x] Preserve deferred dedup completion/release behavior and keep the unrelated cache TTL unchanged.
+- [x] Run focused API/downloader tests before Task 2.
 
 ### Task 2: Add hermetic regression coverage for boundary, cancellation, and dedup behavior
 **Goal:** Fast tests prove the old limit is gone, all relevant terminal classifications are truthful, and dedup state is correct.

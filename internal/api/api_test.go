@@ -1,12 +1,17 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/fitz123/sushe/internal/downloader"
 	"github.com/fitz123/sushe/internal/engine"
 	"github.com/fitz123/sushe/internal/logger"
 	"github.com/stretchr/testify/assert"
@@ -209,6 +214,60 @@ func TestNewAPIService(t *testing.T) {
 	assert.Equal(t, "my-token", svc.token)
 	assert.NotNil(t, svc.engine)
 	assert.NotNil(t, svc.dedup)
+	assert.Equal(t, 2*downloader.DefaultTimeout, apiEngineTimeout)
+	assert.Equal(t, apiEngineTimeout, svc.engineTimeout)
+}
+
+func TestEnginePhaseTrackerConcurrentAccess(t *testing.T) {
+	tracker := &enginePhaseTracker{}
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			tracker.set("encoding")
+		}()
+		go func() {
+			defer wg.Done()
+			_ = tracker.current()
+		}()
+	}
+	wg.Wait()
+
+	tracker.set("splitting")
+	assert.Equal(t, "splitting", tracker.current())
+}
+
+func TestEngineTerminalErrorAPIDeadline(t *testing.T) {
+	ctx, cancel := context.WithDeadlineCause(context.Background(), time.Now().Add(-time.Second), errAPIEngineDeadline)
+	defer cancel()
+	<-ctx.Done()
+
+	err := engineTerminalError(ctx, errors.New("signal: killed"), "splitting", apiEngineTimeout)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Contains(t, err.Error(), "API engine deadline exceeded")
+	assert.Contains(t, err.Error(), "splitting")
+	assert.Contains(t, err.Error(), apiEngineTimeout.String())
+}
+
+func TestEngineTerminalErrorCallerCancellation(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	ctx, cancelTimeout := context.WithTimeoutCause(parent, apiEngineTimeout, errAPIEngineDeadline)
+	cancelParent()
+	defer cancelTimeout()
+	<-ctx.Done()
+
+	err := engineTerminalError(ctx, errors.New("signal: killed"), "encoding", apiEngineTimeout)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Contains(t, err.Error(), "request canceled by client")
+	assert.Contains(t, err.Error(), "encoding")
+	assert.NotContains(t, err.Error(), "API engine deadline exceeded")
+}
+
+func TestEngineTerminalErrorPreservesOrdinaryError(t *testing.T) {
+	want := errors.New("extractor failed")
+	got := engineTerminalError(context.Background(), want, "downloading", apiEngineTimeout)
+	assert.Same(t, want, got)
 }
 
 func TestAuthBearerFormat(t *testing.T) {

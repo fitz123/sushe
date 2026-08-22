@@ -35,6 +35,35 @@ func TestNewYTDLPPath(t *testing.T) {
 	}
 }
 
+func TestYTDLPTerminalErrorOwnDeadline(t *testing.T) {
+	d := &Downloader{timeout: 37 * time.Millisecond}
+	ctx, cancel := context.WithDeadlineCause(context.Background(), time.Now().Add(-time.Second), errYTDLPDeadline)
+	defer cancel()
+	<-ctx.Done()
+
+	err := d.ytdlpTerminalError(ctx, errors.New("signal: killed"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ytdlpTerminalError() = %v, want context deadline exceeded", err)
+	}
+	if !strings.Contains(err.Error(), d.timeout.String()) {
+		t.Fatalf("ytdlpTerminalError() = %q, want bound %q", err, d.timeout)
+	}
+}
+
+func TestYTDLPTerminalErrorPreservesCallerCancellation(t *testing.T) {
+	d := &Downloader{timeout: time.Hour}
+	parent, cancelParent := context.WithCancel(context.Background())
+	ctx, cancelTimeout := context.WithTimeoutCause(parent, d.timeout, errYTDLPDeadline)
+	cancelParent()
+	defer cancelTimeout()
+	<-ctx.Done()
+
+	want := errors.New("signal: killed")
+	if got := d.ytdlpTerminalError(ctx, want); got != want {
+		t.Fatalf("ytdlpTerminalError() = %v, want original error %v", got, want)
+	}
+}
+
 func TestConfiguredYTDLPExecutableIsInvoked(t *testing.T) {
 	logger.Init("error")
 
@@ -97,7 +126,7 @@ printf 'invoked\n' > "$YTDLP_MARKER"
 
 func TestCookieArgs(t *testing.T) {
 	tests := []struct {
-		name string
+		name    string
 		path    string
 		want    []string
 		wantNil bool // empty path must return literal nil, not an empty slice

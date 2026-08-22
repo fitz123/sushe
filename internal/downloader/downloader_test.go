@@ -554,6 +554,37 @@ func TestCanStreamCopyDecision(t *testing.T) {
 	}
 }
 
+func TestSanitizeYTDLPOutput(t *testing.T) {
+	input := strings.Join([]string{
+		`[generic] Extracting URL: https://media.example/video.mp4?expires=123&srcIp=192.0.2.1&sig=secret`,
+		`[generic] video.mp4?expires=123&srcAg=GECKO&sig=secret: Downloading webpage`,
+		`ERROR: HTTP Error 403 with access_token=secret`,
+	}, "\n")
+
+	got := sanitizeYTDLPOutput(input)
+	for _, forbidden := range []string{
+		"media.example",
+		"video.mp4?expires",
+		"192.0.2.1",
+		"sig=secret",
+		"access_token=secret",
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("sanitizeYTDLPOutput() leaked %q in %q", forbidden, got)
+		}
+	}
+	for _, required := range []string{"<redacted-url>", "<redacted-query-url>", "access_token=<redacted>", "HTTP Error 403"} {
+		if !strings.Contains(got, required) {
+			t.Errorf("sanitizeYTDLPOutput() missing %q in %q", required, got)
+		}
+	}
+
+	err := formatYtdlpError(errors.New("exit status 1"), input)
+	if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "media.example") {
+		t.Fatalf("formatYtdlpError() leaked sanitized source data: %q", err)
+	}
+}
+
 func TestFormatYtdlpError(t *testing.T) {
 	baseErr := errors.New("exit status 1")
 

@@ -79,7 +79,16 @@ type Progress struct {
 // ProgressCallback is called with progress updates
 type ProgressCallback func(Progress)
 
-var errYTDLPDeadline = errors.New("yt-dlp subprocess deadline exceeded")
+var (
+	errYTDLPDeadline = errors.New("yt-dlp subprocess deadline exceeded")
+
+	// yt-dlp repeats source URLs in normal diagnostics and may also use a
+	// filename-plus-query form without a scheme. API inputs can be ephemeral
+	// signed URLs, so neither form may reach logs or user-visible errors.
+	ytdlpURLPattern            = regexp.MustCompile(`https?://[^\s"'<>]+`)
+	ytdlpBareQueryPattern      = regexp.MustCompile(`[^\s"'<>]+\?(?i:expires|srcip|pr|srcag|ms|type|subid|sig|ct|urls|clienttype|appid|zs|id)=[^\s"'<>]+`)
+	ytdlpSensitiveParamPattern = regexp.MustCompile(`(?i)\b(expires|srcip|srcag|subid|sig|urls|clienttype|appid|access_token|token|key|hash)=([^&\s"'<>]+)`)
+)
 
 const (
 	// Local Bot API server allows up to 2GB uploads
@@ -388,9 +397,10 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			err = d.ytdlpTerminalError(cmdCtx, err)
-			logger.Error("yt-dlp failed", "error", err, "output", string(output))
+			safeOutput := sanitizeYTDLPOutput(string(output))
+			logger.Error("yt-dlp failed", "error", err, "output", safeOutput)
 			os.RemoveAll(workDir)
-			return nil, fmt.Errorf("download failed: %w - %s", err, string(output))
+			return nil, fmt.Errorf("download failed: %w - %s", err, safeOutput)
 		}
 	}
 
@@ -542,6 +552,12 @@ func (d *Downloader) ytdlpTerminalError(ctx context.Context, commandErr error) e
 	return commandErr
 }
 
+func sanitizeYTDLPOutput(text string) string {
+	text = ytdlpURLPattern.ReplaceAllString(text, "<redacted-url>")
+	text = ytdlpBareQueryPattern.ReplaceAllString(text, "<redacted-query-url>")
+	return ytdlpSensitiveParamPattern.ReplaceAllString(text, "$1=<redacted>")
+}
+
 // runWithProgress runs yt-dlp and parses progress output
 func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback) error {
 	// Regex patterns for parsing yt-dlp output
@@ -586,7 +602,7 @@ func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback)
 		stderrScanner := bufio.NewScanner(stderr)
 		stderrScanner.Buffer(make([]byte, 64*1024), scannerBufMax)
 		for stderrScanner.Scan() {
-			line := stderrScanner.Text()
+			line := sanitizeYTDLPOutput(stderrScanner.Text())
 			logger.Debug("yt-dlp stderr", "line", line)
 			stderrMu.Lock()
 			stderrBuf.WriteString(line)
@@ -600,7 +616,7 @@ func (d *Downloader) runWithProgress(cmd *exec.Cmd, progressCb ProgressCallback)
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		logger.Debug("yt-dlp output", "line", line)
+		logger.Debug("yt-dlp output", "line", sanitizeYTDLPOutput(line))
 
 		// Parse download progress
 		if matches := downloadRe.FindStringSubmatch(line); matches != nil {
@@ -640,7 +656,7 @@ func formatYtdlpError(err error, stderr string) error {
 	if err == nil {
 		return nil
 	}
-	stderr = strings.TrimSpace(stderr)
+	stderr = strings.TrimSpace(sanitizeYTDLPOutput(stderr))
 	if stderr == "" {
 		return err
 	}
@@ -711,7 +727,7 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 
 		var entry map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			logger.Warn("Failed to parse playlist entry", "line", line, "error", err)
+			logger.Warn("Failed to parse playlist entry", "line", sanitizeYTDLPOutput(line), "error", err)
 			continue
 		}
 
@@ -847,9 +863,10 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			err = d.ytdlpTerminalError(cmdCtx, err)
-			logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err, "output", string(output))
+			safeOutput := sanitizeYTDLPOutput(string(output))
+			logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err, "output", safeOutput)
 			os.RemoveAll(workDir)
-			return nil, fmt.Errorf("download failed: %w - %s", err, string(output))
+			return nil, fmt.Errorf("download failed: %w - %s", err, safeOutput)
 		}
 	}
 

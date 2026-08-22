@@ -12,8 +12,15 @@ import (
 
 // Engine encapsulates the download → codec-check → transcode → split pipeline.
 // It does NOT upload — it returns local file paths and metadata.
+type engineDownloader interface {
+	DownloadWithProgress(context.Context, string, downloader.ProgressCallback) (*downloader.DownloadResult, error)
+	GetPlaylistInfo(context.Context, string) (*downloader.PlaylistInfo, error)
+	DownloadPlaylistVideo(context.Context, string, int, downloader.ProgressCallback) (*downloader.DownloadResult, error)
+	SplitVideo(context.Context, string, downloader.ProgressCallback) ([]downloader.PartInfo, error)
+}
+
 type Engine struct {
-	downloader *downloader.Downloader
+	downloader engineDownloader
 }
 
 // NewEngine creates a new Engine with a fresh Downloader instance.
@@ -71,6 +78,10 @@ func (e *Engine) Process(ctx context.Context, url string, progressCb ProgressCal
 			}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		os.RemoveAll(workDir)
+		return nil, err
+	}
 
 	return pr, nil
 }
@@ -84,8 +95,17 @@ func (e *Engine) ProcessPlaylist(ctx context.Context, url string, progressCb fun
 	}
 
 	var results []*ProcessResult
+	cleanupResults := func() {
+		for _, result := range results {
+			e.Cleanup(result)
+		}
+	}
 
 	for i, entry := range info.Entries {
+		if err := ctx.Err(); err != nil {
+			cleanupResults()
+			return nil, err
+		}
 		videoNum := i + 1
 
 		// Per-video progress adapter.
@@ -112,6 +132,10 @@ func (e *Engine) ProcessPlaylist(ctx context.Context, url string, progressCb fun
 		result, err := e.downloader.DownloadPlaylistVideo(ctx, url, i, dlCb)
 		if err != nil {
 			logger.Error("Failed to download playlist video", "index", i, "title", entry.Title, "error", err)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				cleanupResults()
+				return nil, ctxErr
+			}
 			continue
 		}
 
@@ -135,6 +159,10 @@ func (e *Engine) ProcessPlaylist(ctx context.Context, url string, progressCb fun
 			if err != nil {
 				logger.Error("Failed to split playlist video", "index", i, "title", entry.Title, "error", err)
 				os.RemoveAll(workDir)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					cleanupResults()
+					return nil, ctxErr
+				}
 				continue
 			}
 
@@ -152,6 +180,10 @@ func (e *Engine) ProcessPlaylist(ctx context.Context, url string, progressCb fun
 		}
 
 		results = append(results, pr)
+	}
+	if err := ctx.Err(); err != nil {
+		cleanupResults()
+		return nil, err
 	}
 
 	if len(results) == 0 {

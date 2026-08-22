@@ -31,14 +31,26 @@ func newTestService(t *testing.T) *APIService {
 }
 
 type fakeAPIProcessor struct {
-	mu             sync.Mutex
-	processCalls   int
-	processCtxEnds []time.Time
-	cleanupCalls   int
-	processFn      func(context.Context, engine.ProgressCallback, int) (*engine.ProcessResult, error)
+	mu                sync.Mutex
+	playlistChecks    int
+	processCalls      int
+	playlistCalls     int
+	processCtxEnds    []time.Time
+	cleanupCalls      int
+	isPlaylistFn      func(context.Context, int) (bool, *downloader.PlaylistInfo, error)
+	processFn         func(context.Context, engine.ProgressCallback, int) (*engine.ProcessResult, error)
+	processPlaylistFn func(context.Context, func(int, int, string, float64), int) ([]*engine.ProcessResult, error)
 }
 
-func (f *fakeAPIProcessor) IsPlaylist(context.Context, string) (bool, *downloader.PlaylistInfo, error) {
+func (f *fakeAPIProcessor) IsPlaylist(ctx context.Context, _ string) (bool, *downloader.PlaylistInfo, error) {
+	f.mu.Lock()
+	f.playlistChecks++
+	call := f.playlistChecks
+	isPlaylistFn := f.isPlaylistFn
+	f.mu.Unlock()
+	if isPlaylistFn != nil {
+		return isPlaylistFn(ctx, call)
+	}
 	return false, nil, nil
 }
 
@@ -54,8 +66,16 @@ func (f *fakeAPIProcessor) Process(ctx context.Context, _ string, progressCb eng
 	return processFn(ctx, progressCb, call)
 }
 
-func (f *fakeAPIProcessor) ProcessPlaylist(context.Context, string, func(int, int, string, float64)) ([]*engine.ProcessResult, error) {
-	return nil, errors.New("unexpected playlist processing")
+func (f *fakeAPIProcessor) ProcessPlaylist(ctx context.Context, _ string, progressCb func(int, int, string, float64)) ([]*engine.ProcessResult, error) {
+	f.mu.Lock()
+	f.playlistCalls++
+	call := f.playlistCalls
+	processPlaylistFn := f.processPlaylistFn
+	f.mu.Unlock()
+	if processPlaylistFn == nil {
+		return nil, errors.New("unexpected playlist processing")
+	}
+	return processPlaylistFn(ctx, progressCb, call)
 }
 
 func (f *fakeAPIProcessor) Cleanup(*engine.ProcessResult) {
@@ -68,6 +88,18 @@ func (f *fakeAPIProcessor) snapshot() (int, []time.Time, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.processCalls, append([]time.Time(nil), f.processCtxEnds...), f.cleanupCalls
+}
+
+func (f *fakeAPIProcessor) playlistCheckCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.playlistChecks
+}
+
+func (f *fakeAPIProcessor) playlistCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.playlistCalls
 }
 
 func newAPIRequest(ctx context.Context) *http.Request {
@@ -176,6 +208,79 @@ func TestDownloadHandlerAPIDeadlineReportsPhaseAndReleasesDedup(t *testing.T) {
 	assert.Equal(t, "done", retryEvents[len(retryEvents)-1]["status"])
 	processCalls, _, _ := processor.snapshot()
 	assert.Equal(t, 2, processCalls, "a released dedup key must allow an immediate retry")
+}
+
+func TestDownloadHandlerAPIDeadlineDuringPlaylistDetectionReleasesDedup(t *testing.T) {
+	const testTimeout = 15 * time.Millisecond
+	processor := &fakeAPIProcessor{
+		isPlaylistFn: func(ctx context.Context, call int) (bool, *downloader.PlaylistInfo, error) {
+			if call == 1 {
+				<-ctx.Done()
+				return false, nil, ctx.Err()
+			}
+			return false, nil, nil
+		},
+		processFn: func(context.Context, engine.ProgressCallback, int) (*engine.ProcessResult, error) {
+			return &engine.ProcessResult{Title: "Retry succeeded"}, nil
+		},
+	}
+	svc := newTestService(t)
+	svc.processor = processor
+	svc.engineTimeout = testTimeout
+	svc.uploadResultFn = func(*engine.ProcessResult, DownloadRequest) (int, error) { return 902, nil }
+
+	timedOut := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(timedOut, newAPIRequest(context.Background()))
+
+	events := decodeNDJSON(t, timedOut.Body.String())
+	terminal := events[len(events)-1]
+	assert.Equal(t, "error", terminal["status"])
+	assert.Contains(t, terminal["error"], "API engine deadline exceeded during playlist detection")
+	processCalls, _, _ := processor.snapshot()
+	assert.Equal(t, 0, processCalls, "expired detection must not start single-video processing")
+
+	retry := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(retry, newAPIRequest(context.Background()))
+	retryEvents := decodeNDJSON(t, retry.Body.String())
+	assert.Equal(t, "done", retryEvents[len(retryEvents)-1]["status"])
+	processCalls, _, _ = processor.snapshot()
+	assert.Equal(t, 1, processCalls)
+	assert.Equal(t, 2, processor.playlistCheckCount())
+}
+
+func TestDownloadHandlerPlaylistDeadlineReportsPhaseAndReleasesDedup(t *testing.T) {
+	const testTimeout = 15 * time.Millisecond
+	processor := &fakeAPIProcessor{
+		isPlaylistFn: func(context.Context, int) (bool, *downloader.PlaylistInfo, error) {
+			return true, &downloader.PlaylistInfo{PlaylistCount: 2}, nil
+		},
+		processPlaylistFn: func(ctx context.Context, progressCb func(int, int, string, float64), call int) ([]*engine.ProcessResult, error) {
+			if call == 1 {
+				progressCb(2, 2, "splitting", 50)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return []*engine.ProcessResult{{Title: "Retry succeeded"}}, nil
+		},
+	}
+	svc := newTestService(t)
+	svc.processor = processor
+	svc.engineTimeout = testTimeout
+	svc.uploadResultFn = func(*engine.ProcessResult, DownloadRequest) (int, error) { return 903, nil }
+
+	timedOut := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(timedOut, newAPIRequest(context.Background()))
+
+	events := decodeNDJSON(t, timedOut.Body.String())
+	terminal := events[len(events)-1]
+	assert.Equal(t, "error", terminal["status"])
+	assert.Contains(t, terminal["error"], "API engine deadline exceeded during splitting")
+
+	retry := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(retry, newAPIRequest(context.Background()))
+	retryEvents := decodeNDJSON(t, retry.Body.String())
+	assert.Equal(t, "done", retryEvents[len(retryEvents)-1]["status"])
+	assert.Equal(t, 2, processor.playlistCallCount())
 }
 
 func TestDownloadHandlerCallerCancellationIsNotAPIDeadlineAndReleasesDedup(t *testing.T) {

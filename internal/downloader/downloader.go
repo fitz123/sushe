@@ -393,8 +393,12 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	title := strings.TrimSuffix(fileName, filepath.Ext(fileName))
 
 	// Check video codec - re-encode if not H.264 compatible
-	codec, err := GetVideoCodec(filePath)
+	codec, err := getVideoCodec(ctx, filePath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			os.RemoveAll(workDir)
+			return nil, fmt.Errorf("video codec probe canceled: %w", ctxErr)
+		}
 		logger.Warn("Failed to get video codec, assuming needs re-encoding", "error", err)
 		codec = "unknown"
 	}
@@ -455,6 +459,10 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 		cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				os.RemoveAll(workDir)
+				return nil, fmt.Errorf("faststart canceled: %w", ctxErr)
+			}
 			logger.Warn("Failed to apply faststart, using original file", "error", err, "output", string(output))
 		} else {
 			// Replace original with faststart version
@@ -474,13 +482,21 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	}
 
 	// Get video metadata (duration, dimensions)
-	mediaInfo, _ := GetMediaInfo(filePath)
+	mediaInfo, mediaInfoErr := getMediaInfo(ctx, filePath)
+	if mediaInfoErr != nil && ctx.Err() != nil {
+		os.RemoveAll(workDir)
+		return nil, fmt.Errorf("metadata probe canceled: %w", ctx.Err())
+	}
 	var duration float64
 	var width, height int
 	if mediaInfo != nil {
 		duration = mediaInfo.Duration
 		width = mediaInfo.Width
 		height = mediaInfo.Height
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		os.RemoveAll(workDir)
+		return nil, ctxErr
 	}
 
 	return &DownloadResult{
@@ -832,8 +848,12 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	title := strings.TrimSuffix(fileName, filepath.Ext(fileName))
 
 	// Check video codec and apply same processing as single video download
-	codec, err := GetVideoCodec(filePath)
+	codec, err := getVideoCodec(ctx, filePath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			os.RemoveAll(workDir)
+			return nil, fmt.Errorf("video codec probe canceled: %w", ctxErr)
+		}
 		logger.Warn("Failed to get video codec, assuming needs re-encoding", "error", err)
 		codec = "unknown"
 	}
@@ -893,6 +913,10 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 		cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				os.RemoveAll(workDir)
+				return nil, fmt.Errorf("faststart canceled: %w", ctxErr)
+			}
 			logger.Warn("Failed to apply faststart to playlist video, using original", "index", videoIndex, "error", err, "output", string(output))
 		} else {
 			// Replace original with faststart version
@@ -912,13 +936,21 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	}
 
 	// Get video metadata (duration, dimensions)
-	mediaInfo, _ := GetMediaInfo(filePath)
+	mediaInfo, mediaInfoErr := getMediaInfo(ctx, filePath)
+	if mediaInfoErr != nil && ctx.Err() != nil {
+		os.RemoveAll(workDir)
+		return nil, fmt.Errorf("metadata probe canceled: %w", ctx.Err())
+	}
 	var duration float64
 	var width, height int
 	if mediaInfo != nil {
 		duration = mediaInfo.Duration
 		width = mediaInfo.Width
 		height = mediaInfo.Height
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		os.RemoveAll(workDir)
+		return nil, ctxErr
 	}
 
 	return &DownloadResult{
@@ -1012,6 +1044,10 @@ func getContentType(filePath string) string {
 
 // GetMediaInfo uses ffprobe to get video duration, bitrate, and dimensions
 func GetMediaInfo(filePath string) (*MediaInfo, error) {
+	return getMediaInfo(context.Background(), filePath)
+}
+
+func getMediaInfo(ctx context.Context, filePath string) (*MediaInfo, error) {
 	// Use ffprobe to get video info in JSON format
 	args := []string{
 		"-v", "quiet",
@@ -1021,7 +1057,7 @@ func GetMediaInfo(filePath string) (*MediaInfo, error) {
 		filePath,
 	}
 
-	cmd := exec.Command("ffprobe", args...)
+	cmd := exec.CommandContext(ctx, "ffprobe", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe failed: %w", err)
@@ -1072,6 +1108,10 @@ func GetMediaInfo(filePath string) (*MediaInfo, error) {
 
 // GetVideoCodec returns the video codec name (e.g., "h264", "vp9", "av1")
 func GetVideoCodec(filePath string) (string, error) {
+	return getVideoCodec(context.Background(), filePath)
+}
+
+func getVideoCodec(ctx context.Context, filePath string) (string, error) {
 	args := []string{
 		"-v", "quiet",
 		"-select_streams", "v:0",
@@ -1080,7 +1120,7 @@ func GetVideoCodec(filePath string) (string, error) {
 		filePath,
 	}
 
-	cmd := exec.Command("ffprobe", args...)
+	cmd := exec.CommandContext(ctx, "ffprobe", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("ffprobe failed: %w", err)
@@ -1098,6 +1138,10 @@ func IsH264Compatible(codec string) bool {
 
 // GetAudioCodec returns the audio codec name (e.g., "aac", "opus", "vorbis")
 func GetAudioCodec(filePath string) (string, error) {
+	return getAudioCodec(context.Background(), filePath)
+}
+
+func getAudioCodec(ctx context.Context, filePath string) (string, error) {
 	args := []string{
 		"-v", "quiet",
 		"-select_streams", "a:0",
@@ -1105,7 +1149,7 @@ func GetAudioCodec(filePath string) (string, error) {
 		"-of", "csv=p=0",
 		filePath,
 	}
-	cmd := exec.Command("ffprobe", args...)
+	cmd := exec.CommandContext(ctx, "ffprobe", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("ffprobe audio codec failed: %w", err)
@@ -1115,6 +1159,10 @@ func GetAudioCodec(filePath string) (string, error) {
 
 // GetPixelFormat returns the pixel format (e.g., "yuv420p", "yuv420p10le")
 func GetPixelFormat(filePath string) (string, error) {
+	return getPixelFormat(context.Background(), filePath)
+}
+
+func getPixelFormat(ctx context.Context, filePath string) (string, error) {
 	args := []string{
 		"-v", "quiet",
 		"-select_streams", "v:0",
@@ -1122,7 +1170,7 @@ func GetPixelFormat(filePath string) (string, error) {
 		"-of", "csv=p=0",
 		filePath,
 	}
-	cmd := exec.Command("ffprobe", args...)
+	cmd := exec.CommandContext(ctx, "ffprobe", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("ffprobe pixel format failed: %w", err)
@@ -1153,7 +1201,7 @@ func CanStreamCopy(videoCodec, audioCodec, pixFmt string) bool {
 // Returns the path to the new file (original file is kept)
 func (d *Downloader) ReencodeToH264(ctx context.Context, filePath string, progressCb ProgressCallback) (string, error) {
 	// Get duration for progress calculation
-	mediaInfo, err := GetMediaInfo(filePath)
+	mediaInfo, err := getMediaInfo(ctx, filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to get media info: %w", err)
 	}
@@ -1191,8 +1239,10 @@ func (d *Downloader) ReencodeToH264(ctx context.Context, filePath string, progre
 	}
 
 	// Parse ffmpeg progress output
+	scanDone := make(chan struct{})
 	if progressCb != nil {
 		go func() {
+			defer close(scanDone)
 			scanner := bufio.NewScanner(stderr)
 			timeRe := regexp.MustCompile(`time=(\d+):(\d+):(\d+\.?\d*)`)
 			for scanner.Scan() {
@@ -1218,6 +1268,7 @@ func (d *Downloader) ReencodeToH264(ctx context.Context, filePath string, progre
 	} else {
 		// Drain stderr
 		go func() {
+			defer close(scanDone)
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
 				logger.Debug("ffmpeg", "line", scanner.Text())
@@ -1225,8 +1276,10 @@ func (d *Downloader) ReencodeToH264(ctx context.Context, filePath string, progre
 		}()
 	}
 
-	if err := cmd.Wait(); err != nil {
-		return "", fmt.Errorf("ffmpeg encoding failed: %w", err)
+	<-scanDone
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		return "", fmt.Errorf("ffmpeg encoding failed: %w", waitErr)
 	}
 
 	logger.Info("Re-encoding complete", "output", outputPath)
@@ -1248,7 +1301,7 @@ func CalculateNumParts(fileSize int64) int {
 // Falls back to full re-encode with memory-safe settings for incompatible codecs.
 func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb ProgressCallback) ([]PartInfo, error) {
 	// Get media info
-	mediaInfo, err := GetMediaInfo(filePath)
+	mediaInfo, err := getMediaInfo(ctx, filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get media info: %w", err)
 	}
@@ -1261,20 +1314,29 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 	}
 
 	// Detect codecs to determine split strategy
-	videoCodec, err := GetVideoCodec(filePath)
+	videoCodec, err := getVideoCodec(ctx, filePath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("video codec probe canceled: %w", ctxErr)
+		}
 		logger.Warn("Failed to detect video codec, will re-encode", "error", err)
 		videoCodec = "unknown"
 	}
 
-	audioCodec, err := GetAudioCodec(filePath)
+	audioCodec, err := getAudioCodec(ctx, filePath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("audio codec probe canceled: %w", ctxErr)
+		}
 		logger.Warn("Failed to detect audio codec, will re-encode audio", "error", err)
 		audioCodec = "unknown"
 	}
 
-	pixFmt, err := GetPixelFormat(filePath)
+	pixFmt, err := getPixelFormat(ctx, filePath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("pixel format probe canceled: %w", ctxErr)
+		}
 		logger.Warn("Failed to detect pixel format, will re-encode", "error", err)
 		pixFmt = "unknown"
 	}
@@ -1351,8 +1413,10 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 	}
 
 	// Parse ffmpeg progress output
+	scanDone := make(chan struct{})
 	if progressCb != nil {
 		go func() {
+			defer close(scanDone)
 			scanner := bufio.NewScanner(stderr)
 			// Match time=00:01:23.45 pattern
 			timeRe := regexp.MustCompile(`time=(\d+):(\d+):(\d+\.?\d*)`)
@@ -1386,6 +1450,7 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 	} else {
 		// Drain stderr to prevent blocking
 		go func() {
+			defer close(scanDone)
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
 				logger.Debug("ffmpeg", "line", scanner.Text())
@@ -1393,8 +1458,10 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 		}()
 	}
 
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("ffmpeg split failed: %w", err)
+	<-scanDone
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		return nil, fmt.Errorf("ffmpeg split failed: %w", waitErr)
 	}
 
 	// Find all created parts

@@ -94,6 +94,128 @@ func TestDownloadReportsOwnSubprocessTimeoutBound(t *testing.T) {
 	}
 }
 
+func cancelWhenMarkerAppears(ctx context.Context, cancel context.CancelFunc, markerPath string) {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := os.Stat(markerPath); err == nil {
+			cancel()
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestDownloadStopsWhenVideoProbeContextIsCanceled(t *testing.T) {
+	logger.Init("error")
+	tmpDir := t.TempDir()
+	ytdlpPath := filepath.Join(tmpDir, "yt-dlp-stub")
+	if err := os.WriteFile(ytdlpPath, []byte("#!/bin/sh\nset -eu\n: > video.mp4\n"), 0755); err != nil {
+		t.Fatalf("write yt-dlp stub: %v", err)
+	}
+	ffprobePath := filepath.Join(tmpDir, "ffprobe")
+	probeMarker := filepath.Join(tmpDir, "probe-started")
+	if err := os.WriteFile(ffprobePath, []byte("#!/bin/sh\nprintf 'started\\n' > \"$PROBE_MARKER\"\nexec sleep 5\n"), 0755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PROBE_MARKER", probeMarker)
+
+	d := New("", ytdlpPath)
+	d.downloadDir = filepath.Join(tmpDir, "downloads")
+	d.timeout = time.Hour
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go cancelWhenMarkerAppears(ctx, cancel, probeMarker)
+
+	startedAt := time.Now()
+	_, err := d.Download(ctx, "https://example.com/video")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Download() error = %v, want context canceled", err)
+	}
+	if !strings.Contains(err.Error(), "video codec probe canceled") {
+		t.Fatalf("Download() error = %q, want codec probe cancellation", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 3*time.Second {
+		t.Fatalf("Download() took %s, ffprobe did not inherit the caller context", elapsed)
+	}
+}
+
+func TestDownloadDoesNotIgnoreContextCancellationDuringFaststart(t *testing.T) {
+	logger.Init("error")
+	tmpDir := t.TempDir()
+	ytdlpPath := filepath.Join(tmpDir, "yt-dlp-stub")
+	if err := os.WriteFile(ytdlpPath, []byte("#!/bin/sh\nset -eu\n: > video.mp4\n"), 0755); err != nil {
+		t.Fatalf("write yt-dlp stub: %v", err)
+	}
+	ffprobePath := filepath.Join(tmpDir, "ffprobe")
+	if err := os.WriteFile(ffprobePath, []byte("#!/bin/sh\nprintf 'h264\\n'\n"), 0755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+	ffmpegPath := filepath.Join(tmpDir, "ffmpeg")
+	faststartMarker := filepath.Join(tmpDir, "faststart-started")
+	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nprintf 'started\\n' > \"$FASTSTART_MARKER\"\nexec sleep 5\n"), 0755); err != nil {
+		t.Fatalf("write ffmpeg stub: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FASTSTART_MARKER", faststartMarker)
+
+	d := New("", ytdlpPath)
+	d.downloadDir = filepath.Join(tmpDir, "downloads")
+	d.timeout = time.Hour
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go cancelWhenMarkerAppears(ctx, cancel, faststartMarker)
+
+	_, err := d.Download(ctx, "https://example.com/video")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Download() error = %v, want context canceled", err)
+	}
+	if !strings.Contains(err.Error(), "faststart canceled") {
+		t.Fatalf("Download() error = %q, want faststart cancellation instead of original-file fallback", err)
+	}
+}
+
+func TestReencodeWaitsForProgressReader(t *testing.T) {
+	logger.Init("error")
+	tmpDir := t.TempDir()
+	inputPath := filepath.Join(tmpDir, "video.mp4")
+	if err := os.WriteFile(inputPath, []byte("video"), 0644); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	ffprobePath := filepath.Join(tmpDir, "ffprobe")
+	ffprobeStub := `#!/bin/sh
+printf '%s\n' '{"format":{"duration":"10","size":"5","bit_rate":"1"},"streams":[{"codec_type":"video","width":1,"height":1}]}'
+`
+	if err := os.WriteFile(ffprobePath, []byte(ffprobeStub), 0755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+	ffmpegPath := filepath.Join(tmpDir, "ffmpeg")
+	if err := os.WriteFile(ffmpegPath, []byte("#!/bin/sh\nprintf 'time=00:00:01.00\\n' >&2\n"), 0755); err != nil {
+		t.Fatalf("write ffmpeg stub: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	callbackDone := make(chan struct{})
+	d := New("", "")
+	_, err := d.ReencodeToH264(context.Background(), inputPath, func(Progress) {
+		time.Sleep(50 * time.Millisecond)
+		close(callbackDone)
+	})
+	if err != nil {
+		t.Fatalf("ReencodeToH264() error = %v", err)
+	}
+	select {
+	case <-callbackDone:
+	default:
+		t.Fatal("ReencodeToH264 returned before its progress reader completed")
+	}
+}
+
 func TestConfiguredYTDLPExecutableIsInvoked(t *testing.T) {
 	logger.Init("error")
 

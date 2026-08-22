@@ -198,7 +198,17 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	// Check if playlist
 	phase.set("playlist detection")
-	isPlaylist, playlistInfo, _ := s.processor.IsPlaylist(ctx, req.URL)
+	isPlaylist, playlistInfo, playlistErr := s.processor.IsPlaylist(ctx, req.URL)
+	if ctx.Err() != nil {
+		if playlistErr == nil {
+			playlistErr = ctx.Err()
+		}
+		handleErr := engineTerminalError(ctx, playlistErr, phase.current(), engineTimeout)
+		logger.Error("API playlist detection failed", "url", req.URL, "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
+		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: handleErr.Error()})
+		s.dedup.Release(dedupKey)
+		return
+	}
 	if isPlaylist && playlistInfo != nil {
 		s.handlePlaylistDownload(ctx, w, flusher, req, playlistInfo, dedupKey, phase, engineTimeout)
 		return

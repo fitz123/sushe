@@ -64,10 +64,11 @@ sushe/
 3. **HTTP API** (`internal/api/api.go`)
    - `POST /api/download` — download video and send to any Telegram chat/topic
    - Bearer token auth via `SUSHE_API_TOKEN` env
-   - Request deduplication by (url, chat_id, thread_id) with 15-minute TTL
+   - Request deduplication by (url, chat_id, thread_id); active jobs do not expire, while successful results have a separate 15-minute cache TTL
    - Streams NDJSON progress events + final result
+   - Bounds download/processing/splitting with a two-hour engine deadline derived as `2 * downloader.DefaultTimeout`
    - `GET /health` — service health check
-   - Uses engine for download, telebot `Send()` for upload, `SendWithRetry` for 429 handling
+   - Uses engine for download, then telebot `Send()` for upload; each send attempt has the shared 60-minute HTTP client timeout and `SendWithRetry` permits up to three FloodError retries
 
 4. **Bot Handlers** (`internal/bot/bot.go`)
    - `/dl` command + URL auto-detect in messages
@@ -144,6 +145,26 @@ playlist queued events currently omit `eta` because the playlist progress
 callback does not carry detail through (tracked as a TODO in
 `internal/api/types.go`).
 
+**Lifetime and terminal events:** The API applies a two-hour deadline
+(`2 * downloader.DefaultTimeout`) to engine work: playlist detection,
+download, transcoding/processing, and splitting. If that deadline fires, the
+terminal NDJSON error names the latest phase and the two-hour bound. A caller
+or client cancellation is reported separately rather than as a server
+deadline.
+
+Telegram upload starts after engine work and does not accept the engine
+context. It is bounded separately: the shared telebot HTTP client allows 60
+minutes per send attempt, and `SendWithRetry` makes at most three additional
+attempts for FloodError responses. Split parts and playlist results are sent
+sequentially, so the effective end-to-end request lifetime is the engine bound
+plus the finite per-file upload/retry path.
+
+NDJSON clients and reverse proxies must therefore keep their total request and
+read/idle lifetimes compatible with that effective lifecycle, including a
+potentially long interval after an `uploading` event. A progress event is not
+completion: clients must continue reading until a terminal `done` or `error`
+event arrives.
+
 **Errors:**
 - `401` — missing or invalid bearer token
 - `400` — missing `url` or `chat_id`
@@ -152,7 +173,10 @@ callback does not carry detail through (tracked as a TODO in
 
 **Deduplication:** Requests are deduplicated by (url, chat_id, thread_id). If an identical
 request completed within the last 15 minutes, the response contains only the final result
-event (no progress events). If an identical request is currently in progress, returns 409.
+event (no progress events). This completed-result cache TTL is unrelated to job lifetime.
+Active entries never expire and return 409 to duplicates. Engine or upload failures release
+their entry as soon as the handler finishes, allowing an immediate retry; only full successes
+are cached (partial playlist uploads are retryable).
 
 **Health check:** `GET /health` → `OK`
 

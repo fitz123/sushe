@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fitz123/sushe/internal/logger"
@@ -77,6 +79,8 @@ type Progress struct {
 // ProgressCallback is called with progress updates
 type ProgressCallback func(Progress)
 
+var errYTDLPDeadline = errors.New("yt-dlp subprocess deadline exceeded")
+
 const (
 	// Local Bot API server allows up to 2GB uploads
 	MaxFileSize    = 2000 * 1024 * 1024 // 2GB in bytes
@@ -84,10 +88,11 @@ const (
 	MaxSplitSize   = 1700 * 1024 * 1024 // 1.7GB - split target with keyframe overshoot margin
 	DownloadDir    = "/tmp/sushe"
 	DefaultTimeout = 60 * time.Minute // Increased for long videos
+	ytdlpWaitDelay = 5 * time.Second  // Bound inherited output pipes after process exit
 
 	// Playlist limits
-	MaxPlaylistVideos = 50             // Maximum videos per playlist
-	MaxVideoDuration  = 2 * time.Hour  // Skip videos longer than 2 hours
+	MaxPlaylistVideos = 50            // Maximum videos per playlist
+	MaxVideoDuration  = 2 * time.Hour // Skip videos longer than 2 hours
 
 	// minIGGap is the minimum spacing between Instagram-bound yt-dlp invocations
 	// across all goroutines. yt-dlp's --sleep-interval only governs intervals
@@ -117,10 +122,10 @@ type PartInfo struct {
 
 // PlaylistInfo contains information about a playlist
 type PlaylistInfo struct {
-	ID           string            `json:"id"`
-	Title        string            `json:"title"`
-	PlaylistCount int              `json:"playlist_count"`
-	Entries      []PlaylistEntry   `json:"entries"`
+	ID            string          `json:"id"`
+	Title         string          `json:"title"`
+	PlaylistCount int             `json:"playlist_count"`
+	Entries       []PlaylistEntry `json:"entries"`
 }
 
 // PlaylistEntry represents a single video in a playlist
@@ -215,12 +220,27 @@ func New(cookiesPath, ytdlpPath string) *Downloader {
 }
 
 // ytdlpCommand constructs a yt-dlp subprocess with the downloader's writable
-// directory as its temporary directory. The explicit final TMPDIR entry
-// overrides any inherited value when the command environment is de-duplicated.
+// directory as its temporary directory. yt-dlp launches ffmpeg for merges, so
+// each invocation gets its own process group and cancellation kills the whole
+// group. WaitDelay is a final bound for output pipes inherited by an abnormal
+// child. The explicit final TMPDIR entry overrides any inherited value when
+// the command environment is de-duplicated.
 func (d *Downloader) ytdlpCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, d.ytdlpPath, args...)
 	cmd.Dir = dir
 	cmd.Env = append(cmd.Environ(), "TMPDIR="+d.downloadDir)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = ytdlpWaitDelay
 	return cmd
 }
 
@@ -346,10 +366,12 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 		url,
 	)
 
-	logger.Debug("Running yt-dlp", "args", args)
+	// Do not log arguments: the source URL may contain ephemeral signed query
+	// credentials. Count is enough to diagnose invocation-shape drift.
+	logger.Debug("Running yt-dlp", "argument_count", len(args))
 
 	// Create context with timeout
-	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
+	cmdCtx, cancel := context.WithTimeoutCause(ctx, d.timeout, errYTDLPDeadline)
 	defer cancel()
 
 	cmd := d.ytdlpCommand(cmdCtx, workDir, args...)
@@ -357,6 +379,7 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	// If we have a progress callback, stream output; otherwise use simple execution
 	if progressCb != nil {
 		if err := d.runWithProgress(cmd, progressCb); err != nil {
+			err = d.ytdlpTerminalError(cmdCtx, err)
 			logger.Error("yt-dlp failed", "error", err)
 			os.RemoveAll(workDir)
 			return nil, fmt.Errorf("download failed: %w", err)
@@ -364,6 +387,7 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	} else {
 		output, err := cmd.CombinedOutput()
 		if err != nil {
+			err = d.ytdlpTerminalError(cmdCtx, err)
 			logger.Error("yt-dlp failed", "error", err, "output", string(output))
 			os.RemoveAll(workDir)
 			return nil, fmt.Errorf("download failed: %w - %s", err, string(output))
@@ -388,8 +412,12 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	title := strings.TrimSuffix(fileName, filepath.Ext(fileName))
 
 	// Check video codec - re-encode if not H.264 compatible
-	codec, err := GetVideoCodec(filePath)
+	codec, err := getVideoCodec(ctx, filePath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			os.RemoveAll(workDir)
+			return nil, fmt.Errorf("video codec probe canceled: %w", ctxErr)
+		}
 		logger.Warn("Failed to get video codec, assuming needs re-encoding", "error", err)
 		codec = "unknown"
 	}
@@ -450,6 +478,10 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 		cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				os.RemoveAll(workDir)
+				return nil, fmt.Errorf("faststart canceled: %w", ctxErr)
+			}
 			logger.Warn("Failed to apply faststart, using original file", "error", err, "output", string(output))
 		} else {
 			// Replace original with faststart version
@@ -469,13 +501,21 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 	}
 
 	// Get video metadata (duration, dimensions)
-	mediaInfo, _ := GetMediaInfo(filePath)
+	mediaInfo, mediaInfoErr := getMediaInfo(ctx, filePath)
+	if mediaInfoErr != nil && ctx.Err() != nil {
+		os.RemoveAll(workDir)
+		return nil, fmt.Errorf("metadata probe canceled: %w", ctx.Err())
+	}
 	var duration float64
 	var width, height int
 	if mediaInfo != nil {
 		duration = mediaInfo.Duration
 		width = mediaInfo.Width
 		height = mediaInfo.Height
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		os.RemoveAll(workDir)
+		return nil, ctxErr
 	}
 
 	return &DownloadResult{
@@ -490,6 +530,16 @@ func (d *Downloader) DownloadWithProgress(ctx context.Context, url string, progr
 		IsSplit:     false,
 		Parts:       nil,
 	}, nil
+}
+
+// ytdlpTerminalError identifies only the downloader's own subprocess deadline.
+// If the caller's context ended first, its cause is preserved for the caller to
+// classify at that lifecycle boundary.
+func (d *Downloader) ytdlpTerminalError(ctx context.Context, commandErr error) error {
+	if errors.Is(context.Cause(ctx), errYTDLPDeadline) {
+		return fmt.Errorf("yt-dlp subprocess deadline exceeded after %s: %w", d.timeout, context.DeadlineExceeded)
+	}
+	return commandErr
 }
 
 // runWithProgress runs yt-dlp and parses progress output
@@ -633,7 +683,9 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 		url,
 	)
 
-	logger.Debug("Checking if URL is playlist", "args", args)
+	// Do not log arguments: the source URL may contain ephemeral signed query
+	// credentials. Count is enough to diagnose invocation-shape drift.
+	logger.Debug("Checking if URL is playlist", "argument_count", len(args))
 
 	cmd := d.ytdlpCommand(ctx, "", args...)
 	output, err := cmd.Output()
@@ -667,7 +719,7 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 		id, _ := entry["id"].(string)
 		title, _ := entry["title"].(string)
 		url, _ := entry["url"].(string)
-		
+
 		// Handle duration (might be null for unavailable videos)
 		var duration float64
 		if d, ok := entry["duration"]; ok && d != nil {
@@ -729,10 +781,10 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 	}
 
 	return &PlaylistInfo{
-		ID:           playlistID,
-		Title:        playlistTitle,
+		ID:            playlistID,
+		Title:         playlistTitle,
 		PlaylistCount: len(validEntries),
-		Entries:      validEntries,
+		Entries:       validEntries,
 	}, nil
 }
 
@@ -740,8 +792,8 @@ func (d *Downloader) GetPlaylistInfo(ctx context.Context, url string) (*Playlist
 //
 // Per-item IG rate limiting: each playlist item is an actual media download
 // (the burst signal Instagram flags), so the gate runs per item. With a 50-item
-// IG playlist at minIGGap=8s the floor wait is 50*8s = ~6min of gating — well
-// within the 15-minute request timeout, and playlists are inherently slow.
+// IG playlist at minIGGap=8s the floor wait is 50*8s = ~6min of gating, and
+// playlists are inherently slow.
 func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL string, videoIndex int, progressCb ProgressCallback) (*DownloadResult, error) {
 	// Enforce per-item IG rate-limit gap.
 	if err := d.waitForIGSlot(ctx, playlistURL, progressCb); err != nil {
@@ -773,10 +825,12 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 		playlistURL,
 	)
 
-	logger.Debug("Downloading playlist video", "index", videoIndex, "args", args)
+	// Do not log arguments: the source URL may contain ephemeral signed query
+	// credentials. Count is enough to diagnose invocation-shape drift.
+	logger.Debug("Downloading playlist video", "index", videoIndex, "argument_count", len(args))
 
 	// Create context with timeout
-	cmdCtx, cancel := context.WithTimeout(ctx, d.timeout)
+	cmdCtx, cancel := context.WithTimeoutCause(ctx, d.timeout, errYTDLPDeadline)
 	defer cancel()
 
 	cmd := d.ytdlpCommand(cmdCtx, workDir, args...)
@@ -784,6 +838,7 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	// If we have a progress callback, stream output; otherwise use simple execution
 	if progressCb != nil {
 		if err := d.runWithProgress(cmd, progressCb); err != nil {
+			err = d.ytdlpTerminalError(cmdCtx, err)
 			logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err)
 			os.RemoveAll(workDir)
 			return nil, fmt.Errorf("download failed: %w", err)
@@ -791,6 +846,7 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	} else {
 		output, err := cmd.CombinedOutput()
 		if err != nil {
+			err = d.ytdlpTerminalError(cmdCtx, err)
 			logger.Error("yt-dlp failed for playlist video", "index", videoIndex, "error", err, "output", string(output))
 			os.RemoveAll(workDir)
 			return nil, fmt.Errorf("download failed: %w - %s", err, string(output))
@@ -815,8 +871,12 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	title := strings.TrimSuffix(fileName, filepath.Ext(fileName))
 
 	// Check video codec and apply same processing as single video download
-	codec, err := GetVideoCodec(filePath)
+	codec, err := getVideoCodec(ctx, filePath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			os.RemoveAll(workDir)
+			return nil, fmt.Errorf("video codec probe canceled: %w", ctxErr)
+		}
 		logger.Warn("Failed to get video codec, assuming needs re-encoding", "error", err)
 		codec = "unknown"
 	}
@@ -876,6 +936,10 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 		cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				os.RemoveAll(workDir)
+				return nil, fmt.Errorf("faststart canceled: %w", ctxErr)
+			}
 			logger.Warn("Failed to apply faststart to playlist video, using original", "index", videoIndex, "error", err, "output", string(output))
 		} else {
 			// Replace original with faststart version
@@ -895,13 +959,21 @@ func (d *Downloader) DownloadPlaylistVideo(ctx context.Context, playlistURL stri
 	}
 
 	// Get video metadata (duration, dimensions)
-	mediaInfo, _ := GetMediaInfo(filePath)
+	mediaInfo, mediaInfoErr := getMediaInfo(ctx, filePath)
+	if mediaInfoErr != nil && ctx.Err() != nil {
+		os.RemoveAll(workDir)
+		return nil, fmt.Errorf("metadata probe canceled: %w", ctx.Err())
+	}
 	var duration float64
 	var width, height int
 	if mediaInfo != nil {
 		duration = mediaInfo.Duration
 		width = mediaInfo.Width
 		height = mediaInfo.Height
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		os.RemoveAll(workDir)
+		return nil, ctxErr
 	}
 
 	return &DownloadResult{
@@ -995,6 +1067,10 @@ func getContentType(filePath string) string {
 
 // GetMediaInfo uses ffprobe to get video duration, bitrate, and dimensions
 func GetMediaInfo(filePath string) (*MediaInfo, error) {
+	return getMediaInfo(context.Background(), filePath)
+}
+
+func getMediaInfo(ctx context.Context, filePath string) (*MediaInfo, error) {
 	// Use ffprobe to get video info in JSON format
 	args := []string{
 		"-v", "quiet",
@@ -1004,7 +1080,7 @@ func GetMediaInfo(filePath string) (*MediaInfo, error) {
 		filePath,
 	}
 
-	cmd := exec.Command("ffprobe", args...)
+	cmd := exec.CommandContext(ctx, "ffprobe", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("ffprobe failed: %w", err)
@@ -1055,6 +1131,10 @@ func GetMediaInfo(filePath string) (*MediaInfo, error) {
 
 // GetVideoCodec returns the video codec name (e.g., "h264", "vp9", "av1")
 func GetVideoCodec(filePath string) (string, error) {
+	return getVideoCodec(context.Background(), filePath)
+}
+
+func getVideoCodec(ctx context.Context, filePath string) (string, error) {
 	args := []string{
 		"-v", "quiet",
 		"-select_streams", "v:0",
@@ -1063,7 +1143,7 @@ func GetVideoCodec(filePath string) (string, error) {
 		filePath,
 	}
 
-	cmd := exec.Command("ffprobe", args...)
+	cmd := exec.CommandContext(ctx, "ffprobe", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("ffprobe failed: %w", err)
@@ -1081,6 +1161,10 @@ func IsH264Compatible(codec string) bool {
 
 // GetAudioCodec returns the audio codec name (e.g., "aac", "opus", "vorbis")
 func GetAudioCodec(filePath string) (string, error) {
+	return getAudioCodec(context.Background(), filePath)
+}
+
+func getAudioCodec(ctx context.Context, filePath string) (string, error) {
 	args := []string{
 		"-v", "quiet",
 		"-select_streams", "a:0",
@@ -1088,7 +1172,7 @@ func GetAudioCodec(filePath string) (string, error) {
 		"-of", "csv=p=0",
 		filePath,
 	}
-	cmd := exec.Command("ffprobe", args...)
+	cmd := exec.CommandContext(ctx, "ffprobe", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("ffprobe audio codec failed: %w", err)
@@ -1098,6 +1182,10 @@ func GetAudioCodec(filePath string) (string, error) {
 
 // GetPixelFormat returns the pixel format (e.g., "yuv420p", "yuv420p10le")
 func GetPixelFormat(filePath string) (string, error) {
+	return getPixelFormat(context.Background(), filePath)
+}
+
+func getPixelFormat(ctx context.Context, filePath string) (string, error) {
 	args := []string{
 		"-v", "quiet",
 		"-select_streams", "v:0",
@@ -1105,7 +1193,7 @@ func GetPixelFormat(filePath string) (string, error) {
 		"-of", "csv=p=0",
 		filePath,
 	}
-	cmd := exec.Command("ffprobe", args...)
+	cmd := exec.CommandContext(ctx, "ffprobe", args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("ffprobe pixel format failed: %w", err)
@@ -1136,7 +1224,7 @@ func CanStreamCopy(videoCodec, audioCodec, pixFmt string) bool {
 // Returns the path to the new file (original file is kept)
 func (d *Downloader) ReencodeToH264(ctx context.Context, filePath string, progressCb ProgressCallback) (string, error) {
 	// Get duration for progress calculation
-	mediaInfo, err := GetMediaInfo(filePath)
+	mediaInfo, err := getMediaInfo(ctx, filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to get media info: %w", err)
 	}
@@ -1174,8 +1262,10 @@ func (d *Downloader) ReencodeToH264(ctx context.Context, filePath string, progre
 	}
 
 	// Parse ffmpeg progress output
+	scanDone := make(chan struct{})
 	if progressCb != nil {
 		go func() {
+			defer close(scanDone)
 			scanner := bufio.NewScanner(stderr)
 			timeRe := regexp.MustCompile(`time=(\d+):(\d+):(\d+\.?\d*)`)
 			for scanner.Scan() {
@@ -1201,6 +1291,7 @@ func (d *Downloader) ReencodeToH264(ctx context.Context, filePath string, progre
 	} else {
 		// Drain stderr
 		go func() {
+			defer close(scanDone)
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
 				logger.Debug("ffmpeg", "line", scanner.Text())
@@ -1208,8 +1299,10 @@ func (d *Downloader) ReencodeToH264(ctx context.Context, filePath string, progre
 		}()
 	}
 
-	if err := cmd.Wait(); err != nil {
-		return "", fmt.Errorf("ffmpeg encoding failed: %w", err)
+	<-scanDone
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		return "", fmt.Errorf("ffmpeg encoding failed: %w", waitErr)
 	}
 
 	logger.Info("Re-encoding complete", "output", outputPath)
@@ -1231,7 +1324,7 @@ func CalculateNumParts(fileSize int64) int {
 // Falls back to full re-encode with memory-safe settings for incompatible codecs.
 func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb ProgressCallback) ([]PartInfo, error) {
 	// Get media info
-	mediaInfo, err := GetMediaInfo(filePath)
+	mediaInfo, err := getMediaInfo(ctx, filePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get media info: %w", err)
 	}
@@ -1244,20 +1337,29 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 	}
 
 	// Detect codecs to determine split strategy
-	videoCodec, err := GetVideoCodec(filePath)
+	videoCodec, err := getVideoCodec(ctx, filePath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("video codec probe canceled: %w", ctxErr)
+		}
 		logger.Warn("Failed to detect video codec, will re-encode", "error", err)
 		videoCodec = "unknown"
 	}
 
-	audioCodec, err := GetAudioCodec(filePath)
+	audioCodec, err := getAudioCodec(ctx, filePath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("audio codec probe canceled: %w", ctxErr)
+		}
 		logger.Warn("Failed to detect audio codec, will re-encode audio", "error", err)
 		audioCodec = "unknown"
 	}
 
-	pixFmt, err := GetPixelFormat(filePath)
+	pixFmt, err := getPixelFormat(ctx, filePath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("pixel format probe canceled: %w", ctxErr)
+		}
 		logger.Warn("Failed to detect pixel format, will re-encode", "error", err)
 		pixFmt = "unknown"
 	}
@@ -1334,8 +1436,10 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 	}
 
 	// Parse ffmpeg progress output
+	scanDone := make(chan struct{})
 	if progressCb != nil {
 		go func() {
+			defer close(scanDone)
 			scanner := bufio.NewScanner(stderr)
 			// Match time=00:01:23.45 pattern
 			timeRe := regexp.MustCompile(`time=(\d+):(\d+):(\d+\.?\d*)`)
@@ -1369,6 +1473,7 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 	} else {
 		// Drain stderr to prevent blocking
 		go func() {
+			defer close(scanDone)
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
 				logger.Debug("ffmpeg", "line", scanner.Text())
@@ -1376,8 +1481,10 @@ func (d *Downloader) SplitVideo(ctx context.Context, filePath string, progressCb
 		}()
 	}
 
-	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("ffmpeg split failed: %w", err)
+	<-scanDone
+	waitErr := cmd.Wait()
+	if waitErr != nil {
+		return nil, fmt.Errorf("ffmpeg split failed: %w", waitErr)
 	}
 
 	// Find all created parts

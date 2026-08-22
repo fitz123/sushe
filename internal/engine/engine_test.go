@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +12,39 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type cancelingPlaylistDownloader struct {
+	firstResult *downloader.DownloadResult
+	cancel      context.CancelFunc
+	calls       int
+}
+
+func (d *cancelingPlaylistDownloader) DownloadWithProgress(context.Context, string, downloader.ProgressCallback) (*downloader.DownloadResult, error) {
+	return nil, errors.New("unexpected single-video download")
+}
+
+func (d *cancelingPlaylistDownloader) GetPlaylistInfo(context.Context, string) (*downloader.PlaylistInfo, error) {
+	return &downloader.PlaylistInfo{
+		PlaylistCount: 2,
+		Entries: []downloader.PlaylistEntry{
+			{Title: "first"},
+			{Title: "second"},
+		},
+	}, nil
+}
+
+func (d *cancelingPlaylistDownloader) DownloadPlaylistVideo(ctx context.Context, _ string, _ int, _ downloader.ProgressCallback) (*downloader.DownloadResult, error) {
+	d.calls++
+	if d.calls == 1 {
+		return d.firstResult, nil
+	}
+	d.cancel()
+	return nil, ctx.Err()
+}
+
+func (d *cancelingPlaylistDownloader) SplitVideo(context.Context, string, downloader.ProgressCallback) ([]downloader.PartInfo, error) {
+	return nil, errors.New("unexpected split")
+}
 
 func TestMain(m *testing.M) {
 	logger.Init("error") // quiet logger for tests
@@ -109,6 +144,34 @@ func TestCleanupEmptyWorkDir(t *testing.T) {
 	result := &ProcessResult{WorkDir: ""}
 	// Should not panic
 	eng.Cleanup(result)
+}
+
+func TestProcessPlaylistCancellationDiscardsPartialResults(t *testing.T) {
+	tmpDir := t.TempDir()
+	firstWorkDir := filepath.Join(tmpDir, "first")
+	require.NoError(t, os.MkdirAll(firstWorkDir, 0755))
+	firstPath := filepath.Join(firstWorkDir, "first.mp4")
+	require.NoError(t, os.WriteFile(firstPath, []byte("video"), 0644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	downloaderFake := &cancelingPlaylistDownloader{
+		firstResult: &downloader.DownloadResult{
+			FilePath: firstPath,
+			FileName: "first.mp4",
+			Title:    "first",
+			FileSize: 5,
+		},
+		cancel: cancel,
+	}
+	eng := &Engine{downloader: downloaderFake}
+
+	results, err := eng.ProcessPlaylist(ctx, "https://example.com/playlist", nil)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, results)
+	assert.Equal(t, 2, downloaderFake.calls)
+	_, statErr := os.Stat(firstWorkDir)
+	assert.True(t, os.IsNotExist(statErr), "partial playlist work directory must be cleaned up")
 }
 
 func TestAdaptProgressCbNil(t *testing.T) {

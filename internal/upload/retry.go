@@ -23,7 +23,9 @@ func SanitizeError(err error) error {
 }
 
 // SendWithRetry wraps bot.Send with 429/FloodError retry logic.
-// On tele.FloodError, it sleeps for RetryAfter seconds and retries up to maxRetries times.
+// Each attempt remains subject to the telebot client's configured HTTP timeout.
+// On tele.FloodError, it sleeps for RetryAfter seconds and retries up to maxRetries
+// times, keeping the upload retry path finite.
 func SendWithRetry(bot *tele.Bot, to tele.Recipient, what interface{}, opts ...interface{}) (*tele.Message, error) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		msg, err := bot.Send(to, what, opts...)

@@ -4,34 +4,86 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/fitz123/sushe/internal/downloader"
 	"github.com/fitz123/sushe/internal/engine"
 	"github.com/fitz123/sushe/internal/logger"
 	"github.com/fitz123/sushe/internal/upload"
 	tele "gopkg.in/telebot.v3"
 )
 
+// apiEngineTimeout bounds API engine work (detection, download, processing,
+// and splitting). It provides one downloader window plus an equal processing
+// envelope. Telegram upload follows afterward under its own per-attempt HTTP
+// client timeout and finite retry count.
+const apiEngineTimeout = 2 * downloader.DefaultTimeout
+
+var errAPIEngineDeadline = errors.New("API engine deadline exceeded")
+
+// apiProcessor is the engine surface used by the HTTP handler. Keeping the
+// seam private lets handler tests use a hermetic processor while preserving
+// NewAPIService's concrete public constructor.
+type apiProcessor interface {
+	IsPlaylist(context.Context, string) (bool, *downloader.PlaylistInfo, error)
+	Process(context.Context, string, engine.ProgressCallback) (*engine.ProcessResult, error)
+	ProcessPlaylist(context.Context, string, func(int, int, string, float64)) ([]*engine.ProcessResult, error)
+	Cleanup(*engine.ProcessResult)
+}
+
+// enginePhaseTracker records progress callbacks that may arrive from
+// subprocess scanner goroutines while an API handler is inspecting the
+// current phase to report a terminal error.
+type enginePhaseTracker struct {
+	mu    sync.RWMutex
+	phase string
+}
+
+func (t *enginePhaseTracker) set(phase string) {
+	if phase == "" {
+		return
+	}
+	t.mu.Lock()
+	t.phase = phase
+	t.mu.Unlock()
+}
+
+func (t *enginePhaseTracker) current() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.phase == "" {
+		return "starting"
+	}
+	return t.phase
+}
+
 // APIService handles HTTP API requests for video downloads.
 type APIService struct {
-	engine *engine.Engine
-	bot    *tele.Bot
-	token  string
-	dedup  *dedupGuard
+	processor      apiProcessor
+	bot            *tele.Bot
+	token          string
+	dedup          *dedupGuard
+	engineTimeout  time.Duration // unexported per-service override for tests
+	uploadResultFn func(*engine.ProcessResult, DownloadRequest) (int, error)
 }
 
 // NewAPIService creates a new API service.
 func NewAPIService(eng *engine.Engine, bot *tele.Bot, token string) *APIService {
-	return &APIService{
-		engine: eng,
-		bot:    bot,
-		token:  token,
-		dedup:  newDedupGuard(),
+	svc := &APIService{
+		processor:     eng,
+		bot:           bot,
+		token:         token,
+		dedup:         newDedupGuard(),
+		engineTimeout: apiEngineTimeout,
 	}
+	svc.uploadResultFn = svc.uploadResult
+	return svc
 }
 
 // Close stops background resources (dedup cleanup goroutine).
@@ -54,9 +106,10 @@ func (s *APIService) Handler() http.Handler {
 //
 // Dedup guard: requests are deduplicated by (url, chat_id, thread_id) key.
 // If an identical request is already in progress, returns 409 Conflict.
-// In-progress entries never expire — they are cleaned up when the request
-// completes or fails, preventing long uploads from being swept mid-flight.
-// If an identical request completed within the TTL (15 minutes), returns
+// In-progress entries never expire — they are completed on full success or
+// released immediately when the handler observes a failure, preventing long
+// uploads from being swept mid-flight while keeping retries available.
+// If an identical request completed within the unrelated cache TTL (15 minutes), returns
 // the cached ResultEvent as a single NDJSON line with no preceding progress
 // events. On failure (or partial playlist failure), the key is released so
 // the client can retry.
@@ -132,26 +185,42 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Request timeout: 15 minutes
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
+	// The API deadline covers engine work (detection, download, processing, and
+	// splitting). Upload does not accept this context; each send attempt is
+	// instead bounded by the telebot HTTP client, with a finite retry count.
+	engineTimeout := s.engineTimeout
+	ctx, cancel := context.WithTimeoutCause(r.Context(), engineTimeout, errAPIEngineDeadline)
 	defer cancel()
+	phase := &enginePhaseTracker{}
 
 	// Write started event
 	writeJSON(w, flusher, ProgressEvent{Status: "started", URL: req.URL})
 
 	// Check if playlist
-	isPlaylist, playlistInfo, _ := s.engine.IsPlaylist(ctx, req.URL)
+	phase.set("playlist detection")
+	isPlaylist, playlistInfo, playlistErr := s.processor.IsPlaylist(ctx, req.URL)
+	if ctx.Err() != nil {
+		if playlistErr == nil {
+			playlistErr = ctx.Err()
+		}
+		handleErr := engineTerminalError(ctx, playlistErr, phase.current(), engineTimeout)
+		logger.Error("API playlist detection failed", "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
+		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: handleErr.Error()})
+		s.dedup.Release(dedupKey)
+		return
+	}
 	if isPlaylist && playlistInfo != nil {
-		s.handlePlaylistDownload(ctx, w, flusher, req, playlistInfo, dedupKey)
+		s.handlePlaylistDownload(ctx, w, flusher, req, playlistInfo, dedupKey, phase, engineTimeout)
 		return
 	}
 
 	// Single video download
-	s.handleSingleDownload(ctx, w, flusher, req, dedupKey)
+	phase.set("downloading")
+	s.handleSingleDownload(ctx, w, flusher, req, dedupKey, phase, engineTimeout)
 }
 
 // handleSingleDownload processes a single video URL.
-func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, dedupKey string) {
+func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, dedupKey string, phase *enginePhaseTracker, engineTimeout time.Duration) {
 	var finalResult *ResultEvent
 	var handleErr error
 	defer func() {
@@ -164,12 +233,17 @@ func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWr
 		}
 	}()
 
-	progressCb := func(phase string, percent float64, detail string) {
+	progressCb := func(currentPhase string, percent float64, detail string) {
+		if currentPhase != "" {
+			// Record before writing so a concurrent cancellation reports the
+			// newest phase even if flushing the progress event is slow.
+			phase.set(currentPhase)
+		}
 		evt := ProgressEvent{
-			Status:  phase,
+			Status:  currentPhase,
 			Percent: percent,
 		}
-		switch phase {
+		switch currentPhase {
 		case "encoding":
 			if detail != "" {
 				evt.Codec = detail
@@ -183,16 +257,17 @@ func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWr
 		writeJSON(w, flusher, evt)
 	}
 
-	result, err := s.engine.Process(ctx, req.URL, progressCb)
+	result, err := s.processor.Process(ctx, req.URL, progressCb)
 	if err != nil {
-		handleErr = err
-		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: err.Error()})
+		handleErr = engineTerminalError(ctx, err, phase.current(), engineTimeout)
+		logger.Error("API engine job failed", "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
+		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: handleErr.Error()})
 		return
 	}
-	defer s.engine.Cleanup(result)
+	defer s.processor.Cleanup(result)
 
 	// Upload via telebot
-	msgID, err := s.uploadResult(result, req)
+	msgID, err := s.uploadResultFn(result, req)
 	if err != nil {
 		handleErr = err
 		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: fmt.Sprintf("upload failed: %v", err)})
@@ -210,7 +285,7 @@ func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWr
 }
 
 // handlePlaylistDownload processes a playlist URL.
-func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, info interface{}, dedupKey string) {
+func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, req DownloadRequest, info interface{}, dedupKey string, phase *enginePhaseTracker, engineTimeout time.Duration) {
 	var finalResult *ResultEvent
 	var handleErr error
 	defer func() {
@@ -223,19 +298,22 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 		}
 	}()
 
-	progressCb := func(videoNum, totalVideos int, phase string, percent float64) {
+	phase.set("playlist processing")
+	progressCb := func(videoNum, totalVideos int, currentPhase string, percent float64) {
+		phase.set(currentPhase)
 		writeJSON(w, flusher, ProgressEvent{
-			Status:  phase,
+			Status:  currentPhase,
 			Percent: percent,
 			Video:   videoNum,
 			Total:   totalVideos,
 		})
 	}
 
-	results, err := s.engine.ProcessPlaylist(ctx, req.URL, progressCb)
+	results, err := s.processor.ProcessPlaylist(ctx, req.URL, progressCb)
 	if err != nil {
-		handleErr = err
-		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: err.Error()})
+		handleErr = engineTerminalError(ctx, err, phase.current(), engineTimeout)
+		logger.Error("API playlist engine job failed", "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
+		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: handleErr.Error()})
 		return
 	}
 
@@ -249,8 +327,8 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 			Total:  len(results),
 		})
 
-		msgID, err := s.uploadResult(result, req)
-		s.engine.Cleanup(result)
+		msgID, err := s.uploadResultFn(result, req)
+		s.processor.Cleanup(result)
 
 		if err != nil {
 			logger.Error("Failed to upload playlist video", "video", videoNum, "error", err)
@@ -283,6 +361,24 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 		finalResult = result
 	}
 	writeJSON(w, flusher, result)
+}
+
+// engineTerminalError classifies context termination by its cause. When the
+// API's own deadline wins, the terminal message names the latest phase and the
+// configured bound. Ordinary engine failures remain unchanged so extractor
+// and processing details stay intact.
+func engineTerminalError(ctx context.Context, engineErr error, phase string, engineTimeout time.Duration) error {
+	if errors.Is(context.Cause(ctx), errAPIEngineDeadline) {
+		return fmt.Errorf("API engine deadline exceeded during %s (limit %s): %w", phase, engineTimeout, context.DeadlineExceeded)
+	}
+	if ctx.Err() != nil {
+		cause := context.Cause(ctx)
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("request deadline exceeded during %s: %w", phase, cause)
+		}
+		return fmt.Errorf("request canceled by client during %s: %w", phase, cause)
+	}
+	return engineErr
 }
 
 // uploadResult uploads a ProcessResult to a Telegram chat via telebot.

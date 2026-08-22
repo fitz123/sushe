@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fitz123/sushe/internal/logger"
@@ -87,6 +88,7 @@ const (
 	MaxSplitSize   = 1700 * 1024 * 1024 // 1.7GB - split target with keyframe overshoot margin
 	DownloadDir    = "/tmp/sushe"
 	DefaultTimeout = 60 * time.Minute // Increased for long videos
+	ytdlpWaitDelay = 5 * time.Second  // Bound inherited output pipes after process exit
 
 	// Playlist limits
 	MaxPlaylistVideos = 50            // Maximum videos per playlist
@@ -218,12 +220,27 @@ func New(cookiesPath, ytdlpPath string) *Downloader {
 }
 
 // ytdlpCommand constructs a yt-dlp subprocess with the downloader's writable
-// directory as its temporary directory. The explicit final TMPDIR entry
-// overrides any inherited value when the command environment is de-duplicated.
+// directory as its temporary directory. yt-dlp launches ffmpeg for merges, so
+// each invocation gets its own process group and cancellation kills the whole
+// group. WaitDelay is a final bound for output pipes inherited by an abnormal
+// child. The explicit final TMPDIR entry overrides any inherited value when
+// the command environment is de-duplicated.
 func (d *Downloader) ytdlpCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, d.ytdlpPath, args...)
 	cmd.Dir = dir
 	cmd.Env = append(cmd.Environ(), "TMPDIR="+d.downloadDir)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = ytdlpWaitDelay
 	return cmd
 }
 

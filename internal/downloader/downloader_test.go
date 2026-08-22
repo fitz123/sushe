@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -64,33 +65,67 @@ func TestYTDLPTerminalErrorPreservesCallerCancellation(t *testing.T) {
 	}
 }
 
+func TestYTDLPChildProcessHelper(t *testing.T) {
+	if os.Getenv("SUSHE_YTDLP_CHILD_HELPER") != "1" {
+		return
+	}
+
+	child := exec.Command("sleep", "5")
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil {
+		os.Exit(2)
+	}
+	_ = child.Wait()
+	os.Exit(0)
+}
+
 func TestDownloadReportsOwnSubprocessTimeoutBound(t *testing.T) {
 	logger.Init("error")
 
 	tmpDir := t.TempDir()
 	executablePath := filepath.Join(tmpDir, "yt-dlp-stub")
-	stub := "#!/bin/sh\nexec sleep 5\n"
+	// Simulate yt-dlp waiting for an ffmpeg child that inherited its output
+	// pipes. Killing only yt-dlp leaves the child holding those pipes open.
+	stub := "#!/bin/sh\nexec \"$YTDLP_HELPER_BINARY\" -test.run '^TestYTDLPChildProcessHelper$'\n"
 	if err := os.WriteFile(executablePath, []byte(stub), 0755); err != nil {
 		t.Fatalf("write yt-dlp stub: %v", err)
 	}
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
+	t.Setenv("YTDLP_HELPER_BINARY", testBinary)
+	t.Setenv("SUSHE_YTDLP_CHILD_HELPER", "1")
 
-	d := New("", executablePath)
-	d.downloadDir = filepath.Join(tmpDir, "downloads")
-	d.timeout = 25 * time.Millisecond
+	tests := []struct {
+		name       string
+		progressCb ProgressCallback
+	}{
+		{name: "combined output"},
+		{name: "streamed progress", progressCb: func(Progress) {}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := New("", executablePath)
+			d.downloadDir = filepath.Join(tmpDir, strings.ReplaceAll(tt.name, " ", "-"))
+			d.timeout = 500 * time.Millisecond
 
-	startedAt := time.Now()
-	_, err := d.Download(context.Background(), "https://example.com/video")
-	if err == nil {
-		t.Fatal("Download() error = nil, want subprocess deadline error")
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Download() error = %v, want context deadline exceeded", err)
-	}
-	if !strings.Contains(err.Error(), "yt-dlp subprocess deadline exceeded after "+d.timeout.String()) {
-		t.Fatalf("Download() error = %q, want per-download bound %q", err, d.timeout)
-	}
-	if elapsed := time.Since(startedAt); elapsed > time.Second {
-		t.Fatalf("Download() took %s, subprocess timeout was not enforced promptly", elapsed)
+			startedAt := time.Now()
+			_, err := d.DownloadWithProgress(context.Background(), "https://example.com/video", tt.progressCb)
+			if err == nil {
+				t.Fatal("DownloadWithProgress() error = nil, want subprocess deadline error")
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("DownloadWithProgress() error = %v, want context deadline exceeded", err)
+			}
+			if !strings.Contains(err.Error(), "yt-dlp subprocess deadline exceeded after "+d.timeout.String()) {
+				t.Fatalf("DownloadWithProgress() error = %q, want per-download bound %q", err, d.timeout)
+			}
+			if elapsed := time.Since(startedAt); elapsed > 2*time.Second {
+				t.Fatalf("DownloadWithProgress() took %s, subprocess timeout was not enforced promptly", elapsed)
+			}
+		})
 	}
 }
 

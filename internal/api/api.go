@@ -23,6 +23,16 @@ const apiEngineTimeout = 2 * downloader.DefaultTimeout
 
 var errAPIEngineDeadline = errors.New("API engine deadline exceeded")
 
+// apiProcessor is the engine surface used by the HTTP handler. Keeping the
+// seam private lets handler tests use a hermetic processor while preserving
+// NewAPIService's concrete public constructor.
+type apiProcessor interface {
+	IsPlaylist(context.Context, string) (bool, *downloader.PlaylistInfo, error)
+	Process(context.Context, string, engine.ProgressCallback) (*engine.ProcessResult, error)
+	ProcessPlaylist(context.Context, string, func(int, int, string, float64)) ([]*engine.ProcessResult, error)
+	Cleanup(*engine.ProcessResult)
+}
+
 // enginePhaseTracker records progress callbacks that may arrive from
 // subprocess scanner goroutines while an API handler is inspecting the
 // current phase to report a terminal error.
@@ -51,22 +61,25 @@ func (t *enginePhaseTracker) current() string {
 
 // APIService handles HTTP API requests for video downloads.
 type APIService struct {
-	engine        *engine.Engine
-	bot           *tele.Bot
-	token         string
-	dedup         *dedupGuard
-	engineTimeout time.Duration // unexported per-service override for tests
+	processor      apiProcessor
+	bot            *tele.Bot
+	token          string
+	dedup          *dedupGuard
+	engineTimeout  time.Duration // unexported per-service override for tests
+	uploadResultFn func(*engine.ProcessResult, DownloadRequest) (int, error)
 }
 
 // NewAPIService creates a new API service.
 func NewAPIService(eng *engine.Engine, bot *tele.Bot, token string) *APIService {
-	return &APIService{
-		engine:        eng,
+	svc := &APIService{
+		processor:     eng,
 		bot:           bot,
 		token:         token,
 		dedup:         newDedupGuard(),
 		engineTimeout: apiEngineTimeout,
 	}
+	svc.uploadResultFn = svc.uploadResult
+	return svc
 }
 
 // Close stops background resources (dedup cleanup goroutine).
@@ -179,7 +192,7 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	// Check if playlist
 	phase.set("playlist detection")
-	isPlaylist, playlistInfo, _ := s.engine.IsPlaylist(ctx, req.URL)
+	isPlaylist, playlistInfo, _ := s.processor.IsPlaylist(ctx, req.URL)
 	if isPlaylist && playlistInfo != nil {
 		s.handlePlaylistDownload(ctx, w, flusher, req, playlistInfo, dedupKey, phase, engineTimeout)
 		return
@@ -228,17 +241,17 @@ func (s *APIService) handleSingleDownload(ctx context.Context, w http.ResponseWr
 		writeJSON(w, flusher, evt)
 	}
 
-	result, err := s.engine.Process(ctx, req.URL, progressCb)
+	result, err := s.processor.Process(ctx, req.URL, progressCb)
 	if err != nil {
 		handleErr = engineTerminalError(ctx, err, phase.current(), engineTimeout)
 		logger.Error("API engine job failed", "url", req.URL, "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
 		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: handleErr.Error()})
 		return
 	}
-	defer s.engine.Cleanup(result)
+	defer s.processor.Cleanup(result)
 
 	// Upload via telebot
-	msgID, err := s.uploadResult(result, req)
+	msgID, err := s.uploadResultFn(result, req)
 	if err != nil {
 		handleErr = err
 		writeJSON(w, flusher, ResultEvent{Status: "error", OK: false, Error: fmt.Sprintf("upload failed: %v", err)})
@@ -280,7 +293,7 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 		})
 	}
 
-	results, err := s.engine.ProcessPlaylist(ctx, req.URL, progressCb)
+	results, err := s.processor.ProcessPlaylist(ctx, req.URL, progressCb)
 	if err != nil {
 		handleErr = engineTerminalError(ctx, err, phase.current(), engineTimeout)
 		logger.Error("API playlist engine job failed", "url", req.URL, "phase", phase.current(), "engine_timeout", engineTimeout, "error", handleErr)
@@ -298,8 +311,8 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 			Total:  len(results),
 		})
 
-		msgID, err := s.uploadResult(result, req)
-		s.engine.Cleanup(result)
+		msgID, err := s.uploadResultFn(result, req)
+		s.processor.Cleanup(result)
 
 		if err != nil {
 			logger.Error("Failed to upload playlist video", "video", videoNum, "error", err)

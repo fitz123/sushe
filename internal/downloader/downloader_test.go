@@ -64,6 +64,36 @@ func TestYTDLPTerminalErrorPreservesCallerCancellation(t *testing.T) {
 	}
 }
 
+func TestDownloadReportsOwnSubprocessTimeoutBound(t *testing.T) {
+	logger.Init("error")
+
+	tmpDir := t.TempDir()
+	executablePath := filepath.Join(tmpDir, "yt-dlp-stub")
+	stub := "#!/bin/sh\nexec sleep 5\n"
+	if err := os.WriteFile(executablePath, []byte(stub), 0755); err != nil {
+		t.Fatalf("write yt-dlp stub: %v", err)
+	}
+
+	d := New("", executablePath)
+	d.downloadDir = filepath.Join(tmpDir, "downloads")
+	d.timeout = 25 * time.Millisecond
+
+	startedAt := time.Now()
+	_, err := d.Download(context.Background(), "https://example.com/video")
+	if err == nil {
+		t.Fatal("Download() error = nil, want subprocess deadline error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Download() error = %v, want context deadline exceeded", err)
+	}
+	if !strings.Contains(err.Error(), "yt-dlp subprocess deadline exceeded after "+d.timeout.String()) {
+		t.Fatalf("Download() error = %q, want per-download bound %q", err, d.timeout)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("Download() took %s, subprocess timeout was not enforced promptly", elapsed)
+	}
+}
+
 func TestConfiguredYTDLPExecutableIsInvoked(t *testing.T) {
 	logger.Init("error")
 

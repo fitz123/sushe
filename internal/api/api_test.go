@@ -30,6 +30,205 @@ func newTestService(t *testing.T) *APIService {
 	return svc
 }
 
+type fakeAPIProcessor struct {
+	mu             sync.Mutex
+	processCalls   int
+	processCtxEnds []time.Time
+	cleanupCalls   int
+	processFn      func(context.Context, engine.ProgressCallback, int) (*engine.ProcessResult, error)
+}
+
+func (f *fakeAPIProcessor) IsPlaylist(context.Context, string) (bool, *downloader.PlaylistInfo, error) {
+	return false, nil, nil
+}
+
+func (f *fakeAPIProcessor) Process(ctx context.Context, _ string, progressCb engine.ProgressCallback) (*engine.ProcessResult, error) {
+	deadline, _ := ctx.Deadline()
+	f.mu.Lock()
+	f.processCalls++
+	call := f.processCalls
+	f.processCtxEnds = append(f.processCtxEnds, deadline)
+	processFn := f.processFn
+	f.mu.Unlock()
+
+	return processFn(ctx, progressCb, call)
+}
+
+func (f *fakeAPIProcessor) ProcessPlaylist(context.Context, string, func(int, int, string, float64)) ([]*engine.ProcessResult, error) {
+	return nil, errors.New("unexpected playlist processing")
+}
+
+func (f *fakeAPIProcessor) Cleanup(*engine.ProcessResult) {
+	f.mu.Lock()
+	f.cleanupCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeAPIProcessor) snapshot() (int, []time.Time, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.processCalls, append([]time.Time(nil), f.processCtxEnds...), f.cleanupCalls
+}
+
+func newAPIRequest(ctx context.Context) *http.Request {
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/download", strings.NewReader(`{"url":"https://example.com/video","chat_id":123}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-secret-token")
+	return req
+}
+
+func decodeNDJSON(t *testing.T, body string) []map[string]interface{} {
+	t.Helper()
+
+	lines := strings.Split(strings.TrimSpace(body), "\n")
+	events := make([]map[string]interface{}, 0, len(lines))
+	for _, line := range lines {
+		var event map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(line), &event))
+		events = append(events, event)
+	}
+	return events
+}
+
+func TestDownloadHandlerDefaultDeadlineCompletesAndCaches(t *testing.T) {
+	result := &engine.ProcessResult{Title: "Large Video", FileSize: 4_596_000_000}
+	processor := &fakeAPIProcessor{
+		processFn: func(_ context.Context, progressCb engine.ProgressCallback, _ int) (*engine.ProcessResult, error) {
+			progressCb("downloading", 99, "")
+			return result, nil
+		},
+	}
+	svc := newTestService(t)
+	svc.processor = processor
+	uploadCalls := 0
+	svc.uploadResultFn = func(*engine.ProcessResult, DownloadRequest) (int, error) {
+		uploadCalls++
+		return 789, nil
+	}
+
+	startedAt := time.Now()
+	first := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(first, newAPIRequest(context.Background()))
+
+	require.Equal(t, http.StatusOK, first.Code)
+	firstEvents := decodeNDJSON(t, first.Body.String())
+	require.GreaterOrEqual(t, len(firstEvents), 2)
+	firstResult := firstEvents[len(firstEvents)-1]
+	assert.Equal(t, "done", firstResult["status"])
+	assert.Equal(t, true, firstResult["ok"])
+	assert.Equal(t, "Large Video", firstResult["title"])
+	assert.Equal(t, float64(789), firstResult["message_id"])
+
+	processCalls, deadlines, cleanupCalls := processor.snapshot()
+	require.Len(t, deadlines, 1)
+	assert.Greater(t, apiEngineTimeout, 15*time.Minute)
+	assert.Equal(t, 2*downloader.DefaultTimeout, apiEngineTimeout)
+	assert.WithinDuration(t, startedAt.Add(apiEngineTimeout), deadlines[0], time.Second)
+	assert.Equal(t, 1, processCalls)
+	assert.Equal(t, 1, cleanupCalls)
+	assert.Equal(t, 1, uploadCalls)
+
+	cached := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(cached, newAPIRequest(context.Background()))
+
+	require.Equal(t, http.StatusOK, cached.Code)
+	cachedEvents := decodeNDJSON(t, cached.Body.String())
+	require.Len(t, cachedEvents, 1)
+	assert.Equal(t, firstResult, cachedEvents[0])
+	processCalls, _, cleanupCalls = processor.snapshot()
+	assert.Equal(t, 1, processCalls)
+	assert.Equal(t, 1, cleanupCalls)
+	assert.Equal(t, 1, uploadCalls)
+}
+
+func TestDownloadHandlerAPIDeadlineReportsPhaseAndReleasesDedup(t *testing.T) {
+	const testTimeout = 15 * time.Millisecond
+	processor := &fakeAPIProcessor{
+		processFn: func(ctx context.Context, progressCb engine.ProgressCallback, call int) (*engine.ProcessResult, error) {
+			if call == 1 {
+				progressCb("splitting", 50, "")
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return &engine.ProcessResult{Title: "Retry succeeded"}, nil
+		},
+	}
+	svc := newTestService(t)
+	svc.processor = processor
+	svc.engineTimeout = testTimeout
+	svc.uploadResultFn = func(*engine.ProcessResult, DownloadRequest) (int, error) { return 900, nil }
+
+	timedOut := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(timedOut, newAPIRequest(context.Background()))
+
+	require.Equal(t, http.StatusOK, timedOut.Code)
+	events := decodeNDJSON(t, timedOut.Body.String())
+	terminal := events[len(events)-1]
+	assert.Equal(t, "error", terminal["status"])
+	assert.Equal(t, false, terminal["ok"])
+	assert.Contains(t, terminal["error"], "API engine deadline exceeded during splitting")
+	assert.Contains(t, terminal["error"], "limit "+testTimeout.String())
+
+	retry := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(retry, newAPIRequest(context.Background()))
+
+	retryEvents := decodeNDJSON(t, retry.Body.String())
+	assert.Equal(t, "done", retryEvents[len(retryEvents)-1]["status"])
+	processCalls, _, _ := processor.snapshot()
+	assert.Equal(t, 2, processCalls, "a released dedup key must allow an immediate retry")
+}
+
+func TestDownloadHandlerCallerCancellationIsNotAPIDeadlineAndReleasesDedup(t *testing.T) {
+	entered := make(chan struct{})
+	processor := &fakeAPIProcessor{
+		processFn: func(ctx context.Context, progressCb engine.ProgressCallback, call int) (*engine.ProcessResult, error) {
+			if call == 1 {
+				progressCb("encoding", 20, "vp9")
+				close(entered)
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return &engine.ProcessResult{Title: "Retry succeeded"}, nil
+		},
+	}
+	svc := newTestService(t)
+	svc.processor = processor
+	svc.uploadResultFn = func(*engine.ProcessResult, DownloadRequest) (int, error) { return 901, nil }
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	canceled := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		defer close(handlerDone)
+		svc.Handler().ServeHTTP(canceled, newAPIRequest(requestCtx))
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("fake processor did not start")
+	}
+	cancelRequest()
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not return after caller cancellation")
+	}
+
+	events := decodeNDJSON(t, canceled.Body.String())
+	terminal := events[len(events)-1]
+	assert.Equal(t, "error", terminal["status"])
+	assert.Contains(t, terminal["error"], "request canceled by client during encoding")
+	assert.NotContains(t, terminal["error"], "API engine deadline exceeded")
+
+	retry := httptest.NewRecorder()
+	svc.Handler().ServeHTTP(retry, newAPIRequest(context.Background()))
+	retryEvents := decodeNDJSON(t, retry.Body.String())
+	assert.Equal(t, "done", retryEvents[len(retryEvents)-1]["status"])
+	processCalls, _, _ := processor.snapshot()
+	assert.Equal(t, 2, processCalls, "a canceled request must release its dedup key")
+}
+
 func TestAuthMissingToken(t *testing.T) {
 	svc := newTestService(t)
 	handler := svc.Handler()
@@ -212,10 +411,11 @@ func TestNewAPIService(t *testing.T) {
 	svc := NewAPIService(eng, nil, "my-token")
 	assert.NotNil(t, svc)
 	assert.Equal(t, "my-token", svc.token)
-	assert.NotNil(t, svc.engine)
+	assert.NotNil(t, svc.processor)
 	assert.NotNil(t, svc.dedup)
 	assert.Equal(t, 2*downloader.DefaultTimeout, apiEngineTimeout)
 	assert.Equal(t, apiEngineTimeout, svc.engineTimeout)
+	assert.NotNil(t, svc.uploadResultFn)
 }
 
 func TestEnginePhaseTrackerConcurrentAccess(t *testing.T) {

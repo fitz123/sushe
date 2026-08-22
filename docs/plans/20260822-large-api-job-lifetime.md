@@ -48,13 +48,13 @@ go build ./...
 **Goal:** Fast tests prove the old limit is gone, all relevant terminal classifications are truthful, and dedup state is correct.
 **Serves:** The required regression, timeout/cancellation, and safe-retry acceptance evidence without real long sleeps or external services.
 
-- [ ] Add only the minimum unexported processor/upload seams needed for handler-level tests; keep `NewAPIService`'s public signature unchanged.
-- [ ] Add a fake processor that records the context deadline, scripts progress/result/error behavior, and avoids yt-dlp/Telegram.
-- [ ] Test that the default deadline is greater than 15 minutes and equals the documented source-derived relationship to `downloader.DefaultTimeout`, then complete a fake single-video request with `done/ok:true` and cached result.
-- [ ] With a millisecond test override, prove an API deadline names the last phase and bound and releases the dedup key.
-- [ ] Prove caller cancellation is reported as client/request cancellation rather than the API bound and releases the dedup key.
-- [ ] Add a focused downloader test proving its own subprocess timeout names the per-download bound.
-- [ ] Run focused tests plus `go test -race ./internal/api/... -count=1` before Task 3.
+- [x] Add only the minimum unexported processor/upload seams needed for handler-level tests; keep `NewAPIService`'s public signature unchanged.
+- [x] Add a fake processor that records the context deadline, scripts progress/result/error behavior, and avoids yt-dlp/Telegram.
+- [x] Test that the default deadline is greater than 15 minutes and equals the documented source-derived relationship to `downloader.DefaultTimeout`, then complete a fake single-video request with `done/ok:true` and cached result.
+- [x] With a millisecond test override, prove an API deadline names the last phase and bound and releases the dedup key.
+- [x] Prove caller cancellation is reported as client/request cancellation rather than the API bound and releases the dedup key.
+- [x] Add a focused downloader test proving its own subprocess timeout names the per-download bound.
+- [x] Run focused tests plus `go test -race ./internal/api/... -count=1` before Task 3.
 
 ### Task 3: Document and verify effective API lifetime semantics
 **Goal:** Operators and clients understand the composed bounds and no stale API 15-minute claim remains.

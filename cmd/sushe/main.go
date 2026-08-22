@@ -71,8 +71,9 @@ func main() {
 		}
 	}
 
-	// Initialize the bot with local API server
-	// Custom HTTP client with long timeout for large file uploads (up to 2GB via local Bot API)
+	// Initialize the bot with the local API server. The custom HTTP client's
+	// 60-minute timeout bounds each Telegram send attempt for large uploads;
+	// SendWithRetry separately caps how many FloodError retries may follow.
 	botPref := tele.Settings{
 		Token: token,
 		Poller: &tele.LongPoller{

@@ -19,6 +19,10 @@ import (
 	tele "gopkg.in/telebot.v3"
 )
 
+// apiEngineTimeout bounds API engine work (detection, download, processing,
+// and splitting). It provides one downloader window plus an equal processing
+// envelope. Telegram upload follows afterward under its own per-attempt HTTP
+// client timeout and finite retry count.
 const apiEngineTimeout = 2 * downloader.DefaultTimeout
 
 var errAPIEngineDeadline = errors.New("API engine deadline exceeded")
@@ -102,9 +106,10 @@ func (s *APIService) Handler() http.Handler {
 //
 // Dedup guard: requests are deduplicated by (url, chat_id, thread_id) key.
 // If an identical request is already in progress, returns 409 Conflict.
-// In-progress entries never expire — they are cleaned up when the request
-// completes or fails, preventing long uploads from being swept mid-flight.
-// If an identical request completed within the TTL (15 minutes), returns
+// In-progress entries never expire — they are completed on full success or
+// released immediately when the handler observes a failure, preventing long
+// uploads from being swept mid-flight while keeping retries available.
+// If an identical request completed within the unrelated cache TTL (15 minutes), returns
 // the cached ResultEvent as a single NDJSON line with no preceding progress
 // events. On failure (or partial playlist failure), the key is released so
 // the client can retry.
@@ -180,8 +185,9 @@ func (s *APIService) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The API deadline covers engine work (download, processing, and splitting).
-	// Uploads follow the separately bounded Telegram client/retry lifecycle.
+	// The API deadline covers engine work (detection, download, processing, and
+	// splitting). Upload does not accept this context; each send attempt is
+	// instead bounded by the telebot HTTP client, with a finite retry count.
 	engineTimeout := s.engineTimeout
 	ctx, cancel := context.WithTimeoutCause(r.Context(), engineTimeout, errAPIEngineDeadline)
 	defer cancel()
@@ -347,9 +353,10 @@ func (s *APIService) handlePlaylistDownload(ctx context.Context, w http.Response
 	writeJSON(w, flusher, result)
 }
 
-// engineTerminalError classifies context termination by its cause. Ordinary
-// engine failures are returned unchanged so extractor and processing details
-// remain intact.
+// engineTerminalError classifies context termination by its cause. When the
+// API's own deadline wins, the terminal message names the latest phase and the
+// configured bound. Ordinary engine failures remain unchanged so extractor
+// and processing details stay intact.
 func engineTerminalError(ctx context.Context, engineErr error, phase string, engineTimeout time.Duration) error {
 	if errors.Is(context.Cause(ctx), errAPIEngineDeadline) {
 		return fmt.Errorf("API engine deadline exceeded during %s (limit %s): %w", phase, engineTimeout, context.DeadlineExceeded)

@@ -88,8 +88,8 @@ func (d *dedupGuard) TryAcquire(key string) (cachedResult *ResultEvent, acquired
 	}
 
 	// In-progress entries never expire — they are cleaned up via Complete() or Release()
-	// when the request handler finishes. This prevents long-running requests (where upload
-	// extends beyond the context timeout) from having their dedup entry swept.
+	// when the request handler finishes. This prevents long-running requests, including
+	// their separately bounded upload phase, from having their dedup entry swept.
 	return nil, false
 }
 

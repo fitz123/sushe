@@ -15,7 +15,7 @@ A legitimate large single-video `POST /api/download` job can complete download, 
 
 ## Context
 
-- `internal/api/api.go` currently wraps the whole request in `context.WithTimeout(r.Context(), 15*time.Minute)`.
+- `internal/api/api.go` previously wrapped the whole request in `context.WithTimeout(r.Context(), 15*time.Minute)`.
 - `downloader.DefaultTimeout` already permits a single yt-dlp subprocess to run for 60 minutes. A real 4.596 GB 1080p source projected close to that bound and was canceled at 15 minutes before processing/upload.
 - ffprobe/ffmpeg phases inherit the API context. Telegram sends do not accept that context, but each attempt is separately bounded by the bot HTTP client's 60-minute timeout and `SendWithRetry`'s finite retry count. The effective lifecycle is therefore a documented composition, not an unbounded request.
 - In-progress dedup entries intentionally never expire; the handler's deferred `Complete`/`Release` remains authoritative.
@@ -60,10 +60,10 @@ go build ./...
 **Goal:** Operators and clients understand the composed bounds and no stale API 15-minute claim remains.
 **Serves:** The requirement for actionable lifetime semantics and reliable long-running NDJSON clients.
 
-- [ ] Update `AGENTS.md` and touched source comments: the API deadline bounds download/processing/splitting; upload attempts are separately bounded by the finite telebot HTTP timeout/retry path; deadline errors name phase/bound; failures release dedup immediately; successes use the unrelated 15-minute cache TTL.
-- [ ] State that NDJSON clients/proxies must keep their read/idle lifetime compatible with the effective server lifecycle and wait for a terminal event.
-- [ ] Remove stale references to the old 15-minute API request timeout while leaving `dedupTTL` and bot-handler contexts intact.
-- [ ] Run all validation commands and inspect the final diff for issue #31 scope only.
+- [x] Update `AGENTS.md` and touched source comments: the API deadline bounds download/processing/splitting; upload attempts are separately bounded by the finite telebot HTTP timeout/retry path; deadline errors name phase/bound; failures release dedup immediately; successes use the unrelated 15-minute cache TTL.
+- [x] State that NDJSON clients/proxies must keep their read/idle lifetime compatible with the effective server lifecycle and wait for a terminal event.
+- [x] Remove stale references to the old 15-minute API request timeout while leaving `dedupTTL` and bot-handler contexts intact.
+- [x] Run all validation commands and inspect the final diff for issue #31 scope only.
 
 ## Post-Completion
 

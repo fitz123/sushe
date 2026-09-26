@@ -7,7 +7,7 @@ claude_args = --dangerously-skip-permissions --output-format stream-json --verbo
 # Codex review
 codex_enabled = true
 codex_model = gpt-5.3-codex
-codex_reasoning_effort = xhigh
+codex_reasoning_effort = high
 
 # Notifications
 notify_channels = custom
